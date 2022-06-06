@@ -8,10 +8,11 @@
 
   1. Build: `python3 setup.py sdist bdist_wheel`
   2. Twine Distribution:
-      * `twine upload dist/*`
-        * [Preview](https://pypi.org/project/rtsp/)
-      * `twine upload --repository-url https://test.pypi.org/legacy/ dist/*`
-        * [Preview](https://test.pypi.org/project/rtsp/) 
+  2. Distribute:
+    * `twine upload --repository-url https://upload.pypi.org/legacy/ dist/*`
+      * [Preview](https://pypi.org/project/figtion/)
+    * `twine upload --repository-url https://test.pypi.org/legacy/ dist/*`
+      * [Preview](https://test.pypi.org/project/figtion/)
   3. Distribute github backup:
-    1. `git tag 1.2.3 -m "tag for PyPI"`
+    1. `git tag 1.0.0 -m "tag for PyPI"`
     2. `git push --tags remotename branchname`

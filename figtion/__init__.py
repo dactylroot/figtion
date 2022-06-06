@@ -1,49 +1,62 @@
+import os as _os
 import yaml as _yaml
+from pathlib import Path as _Path
 from functools import reduce as _reduce
+import nacl.secret as _secret
 
-# TODO check out https://pypi.org/project/cryptography/ for secret storage
+_MASK_FLAG = "masked configs"
 
 class Config(dict):
     @property
     def filepath(self):
         return self._filepath
 
-    def __init__(self,description = None, filepath = None, defaults = None, secretpath = None):
-        self.description = description
+    def __init__(self,description = None, filepath = None, defaults = None, secretpath = None, verbose=True):
+        self.description = description if description else "configurations"
         self._filepath = filepath
         self._intered = None
         self._masks = {}
+        self._verbose=verbose
 
         if secretpath:
-            self._intered = Config(filepath=secretpath,description="masked configs")
+            self._intered = Config(filepath=secretpath,description=_MASK_FLAG)
 
         ### Precedence of YAML over defaults
         if defaults:
             self.update(defaults)
         if filepath:
-            self.load()
+            self.load(self._verbose)
 
     def dump(self,filepath=None):
         """ Serialize to YAML """
         if filepath:
             self._filepath = filepath
-        try:
-            self._mask()
+
+        self._mask()
+
+        store = "%YAML 1.1\n---\n"
+        store += "# this file should be located at {}\n".format(_os.path.abspath(self.filepath))
+        store += "\n\n"
+        store += "###########################################################\n"
+        store += "####{: ^50} ####\n".format(self.description)
+        store += "###########################################################\n"
+        store += "\n\n"
+        _yams = _yaml.dump(dict(self.items()),default_flow_style=False,indent=4)
+        store += _yams
+        store += "\n\n"
+
+        key = self._getcipherkey()
+        if key: # encrypt secrets before writing
+            box = _secret.SecretBox(key)
+
+            store = box.encrypt(store.encode())
+            with open(self.filepath,'wb') as ymlfile:
+                ymlfile.write(store.nonce + store.ciphertext)
+        else:
             with open(self.filepath,'w') as ymlfile:
-                ymlfile.write("%YAML 1.1\n---\n")
-                ymlfile.write("# this file should be located at {}\n".format(self.filepath))
-                ymlfile.write("\n\n")
-                ymlfile.write("###########################################################\n")
-                if self.description: ymlfile.write("####{: ^50} ####\n".format(self.description))
-                ymlfile.write("###########################################################\n")
-                ymlfile.write("\n\n")
-                _yams = _yaml.dump(dict(self.items()),default_flow_style=False,indent=4)
-                ymlfile.write(_yams)
-                ymlfile.write("\n\n")
-            self._unmask()
-            
-        except Exception as e:
-            print("Couldn't write to {} : {}".format(self.filepath,e))
+                ymlfile.write(store)
+
+        self._unmask()
 
     def _recursive_strict_update(self,a,b):
         """ Update only items from 'b' which already have a key in 'a'.
@@ -65,21 +78,47 @@ class Config(dict):
                     self._recursive_strict_update(a[key],b[key])
                 else:
                     a[key] = b[key]
-        
+
+    def _getcipherkey(self):
+        """ return cipherkey environment variable forced to 32-bit bytestring
+            return None to indicate no encryption """
+        key = _os.getenv("FIGKEY",default="")
+        if not key or self.description != _MASK_FLAG:
+            return None
+        if len(key) > 32:
+            return key[:32].encode()
+        else:
+            return key.ljust(32).encode()
+
     def load(self,verbose=True):
         """ Load from filepath and overwrite local items. """
         try:
-            with open(self.filepath,'r') as ymlfile:
-                newstuff = _yaml.load(ymlfile)
-                self._recursive_strict_update(self,newstuff)
+            key = self._getcipherkey()
+            if key:
+                with open(self.filepath,'rb') as ymlfile:
+                    nc = ymlfile.read()
+                    nonce = nc[:_secret.SecretBox.NONCE_SIZE]
+                    ciphertext = nc[_secret.SecretBox.NONCE_SIZE:]
+
+                box = _secret.SecretBox(key)
+                newstuff = box.decrypt(ciphertext=ciphertext,nonce=nonce)
+                newstuff = newstuff.decode('utf-8')
+
+            else:
+                with open(self.filepath,'r') as ymlfile:
+                    newstuff = ymlfile.read()
+
+            newstuff = _yaml.load(newstuff, Loader=_yaml.FullLoader)
+            self._recursive_strict_update(self,newstuff)
             self._unmask()
         except Exception as e:
-            if verbose:
-                if 'No such file' in e.strerror:
-                    self.dump()
-                    print("Initialized config file {}".format(self.filepath))
-                else:
-                    print("Didn't load from {} : {}".format(self.filepath,e))
+            if verbose and hasattr(e,'strerror') and 'No such file' in e.strerror:
+                self.dump()
+                print("Initialized config file {}".format(self.filepath))
+            elif type(e) is UnicodeDecodeError:
+                raise OSError(f"Missing the encryption key for file '{self.filepath}'")
+            else:
+                raise e
 
     def _nestupdate(self,key,val):
         cfg = self
@@ -90,9 +129,9 @@ class Config(dict):
 
     def _nestread(self,key):
         if len(key.split('.')) > 1:
-            return _reduce(dict.get, key.split('.'), self) 
+            return _reduce(dict.get, key.split('.'), self)
         else:
-            return self[key] 
+            return self[key]
 
     def mask(self,cfg_key,mask='*****'):
         """ Good for sensitive credentials.
@@ -108,11 +147,13 @@ class Config(dict):
 
     def _mask(self):
         if self._masks:
+
+            for key,mask in self._masks.items():
+                self._intered[key] = self._nestread(key)
+                self._nestupdate(key,mask)
+
             self._intered.update({'_masks':self._masks})
             self._intered.dump()
-
-            for key,mask in self._intered.pop('_masks').items():
-                self._nestupdate(key,mask)
 
     def _unmask(self):
         """ resolve hierarchy: {new_val > interred > mask} """
@@ -124,9 +165,9 @@ class Config(dict):
             self._masks.update(self._intered.pop('_masks'))
         except KeyError:
             pass
-        
+
         for key,mask in self._masks.items():
-            current = self._nestread(key) 
+            current = self._nestread(key)
 
             if current != mask:
                 self._intered[key] = current
@@ -138,3 +179,5 @@ class Config(dict):
             except KeyError:
                 pass
 
+with open(_Path(_os.path.abspath(_os.path.dirname(__file__))) / '__doc__','r') as _f:
+    __doc__ = _f.read()
