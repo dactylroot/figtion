@@ -17,9 +17,14 @@ class Config(dict):
         self._intered = None
         self._masks = {}
         self._verbose=verbose
+        self._allsecret = description == _MASK_FLAG
 
         if secretpath:
-            self._intered = Config(filepath=secretpath,description=_MASK_FLAG)
+            if not _filepath:
+                self._filepath = secretpath
+                self._allsecret = True
+            else:
+                self._intered = Config(filepath=secretpath,description=_MASK_FLAG)
 
         ### Precedence of YAML over defaults
         if defaults:
@@ -83,14 +88,14 @@ class Config(dict):
         """ return cipherkey environment variable forced to 32-bit bytestring
             return None to indicate no encryption """
         key = _os.getenv("FIGKEY",default="")
-        if not key or self.description != _MASK_FLAG:
+        if not key or not self._allsecret:
             return None
         if len(key) > 32:
             return key[:32].encode()
         else:
             return key.ljust(32).encode()
 
-    def load(self,verbose=True):
+    def load(self):
         """ Load from filepath and overwrite local items. """
         try:
             key = self._getcipherkey()
@@ -112,9 +117,9 @@ class Config(dict):
             self._recursive_strict_update(self,newstuff)
             self._unmask()
         except Exception as e:
-            if verbose and hasattr(e,'strerror') and 'No such file' in e.strerror:
+            if self._verbose and hasattr(e,'strerror') and 'No such file' in e.strerror:
                 self.dump()
-                print("Initialized config file {}".format(self.filepath))
+                print(f"Initialized config file '{self.filepath}'")
             elif type(e) is UnicodeDecodeError:
                 raise OSError(f"Missing the encryption key for file '{self.filepath}'")
             else:
@@ -159,7 +164,7 @@ class Config(dict):
         """ resolve hierarchy: {new_val > interred > mask} """
         if not self._intered:
             return
-        self._intered.load(verbose=False)
+        self._intered.load()
 
         try:
             self._masks.update(self._intered.pop('_masks'))

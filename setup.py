@@ -6,7 +6,7 @@ with open('README.md') as f:
     long_description = f.read()
 
 name = 'figtion'
-version = '1.0.0'
+version = '1.0.1'
 
 ### include README as main package docfile
 from shutil import copyfile

@@ -81,7 +81,7 @@ class TestFigtion:
             fig = figtion.Config(defaults=self.defaults,filepath=self.confpath,secretpath=self.secretpath)
         except Exception as e:
             assert( type(e) == OSError )
-            assert( str(e).startswith("Missing an encryption key for file"))
+            assert( str(e).startswith("Missing the encryption key for file"))
 
     def test_unencrypted_serialization(self):
         os.environ["FIGKEY"] = ""
@@ -96,3 +96,17 @@ class TestFigtion:
 
         newfig = figtion.Config(filepath=self.openpath)
         assert( newfig['password'] == self.defaults['password'] )
+
+    def test_only_secret(self):
+        fig = figtion.Config(defaults=self.defaults,secretpath=self.secretpath)
+
+        assert( len(fig._masks) == 0 )
+        assert( fig['password'] == self.defaults['password'] )
+
+        os.environ["FIGKEY"] = ""
+
+        try:
+            fig = figtion.Config(defaults=self.defaults,secretpath=self.secretpath)
+        except Exception as e:
+            assert( type(e) == OSError )
+            assert( str(e).startswith("Missing the encryption key for file"))
