@@ -11,26 +11,27 @@ class Config(dict):
     def filepath(self):
         return self._filepath
 
-    def __init__(self,description = None, filepath = None, defaults = None, secretpath = None, verbose=True):
+    def __init__(self,description = None, filepath = None, defaults = None, secretpath = None, verbose=True, promiscuous=False):
         self.description = description if description else "configurations"
         self._filepath = filepath
-        self._intered = None
+        self._interred = None
         self._masks = {}
         self._verbose=verbose
         self._allsecret = description == _MASK_FLAG
+        self._promiscuous = promiscuous or (not defaults)
 
         if secretpath:
-            if not _filepath:
+            if not filepath:
                 self._filepath = secretpath
                 self._allsecret = True
             else:
-                self._intered = Config(filepath=secretpath,description=_MASK_FLAG)
+                self._interred = Config(filepath=secretpath,description=_MASK_FLAG,promiscuous=True)
 
         ### Precedence of YAML over defaults
         if defaults:
             self.update(defaults)
-        if filepath:
-            self.load(self._verbose)
+        if self._filepath:
+            self.load()
 
     def dump(self,filepath=None):
         """ Serialize to YAML """
@@ -66,9 +67,10 @@ class Config(dict):
     def _recursive_strict_update(self,a,b):
         """ Update only items from 'b' which already have a key in 'a'.
             This defines behavior when there is a "schema change".
-            a is used for the input dictionary
-            b is used for the serialized YAML file:
+            a corresponds to canon schema.
+            b corresponds to serialized (potentially outdated) YAML file:
               * only items defined in 'a' are kept
+              * 'promiscuous' mode: items defined in 'b' are also kept
               * values present in 'b' are given priority
          """
         if not a:
@@ -78,11 +80,12 @@ class Config(dict):
             return
 
         for key in b.keys():
-            if key in a.keys():
-                if isinstance(b[key],dict):
-                    self._recursive_strict_update(a[key],b[key])
-                else:
-                    a[key] = b[key]
+            if isinstance(b[key],dict):
+                if not key in a.keys():
+                    a[key] = {}
+                self._recursive_strict_update(a[key],b[key])
+            elif key in a.keys() or self._promiscuous:
+                a[key] = b[key]
 
     def _getcipherkey(self):
         """ return cipherkey environment variable forced to 32-bit bytestring
@@ -142,32 +145,32 @@ class Config(dict):
         """ Good for sensitive credentials.
             Mask is serialized to `self.filepath`.
             True value serialized to `self.secretpath`. """
-        if self._intered is None:
+        if self._interred is None:
             raise Exception('Cannot mask without a secretpath serializing path.')
 
         self._masks[cfg_key] = mask
         if self._nestread(cfg_key) != mask:
-            self._intered[cfg_key] = self._nestread(cfg_key)
+            self._interred[cfg_key] = self._nestread(cfg_key)
         self._unmask()
 
     def _mask(self):
         if self._masks:
 
             for key,mask in self._masks.items():
-                self._intered[key] = self._nestread(key)
+                self._interred[key] = self._nestread(key)
                 self._nestupdate(key,mask)
 
-            self._intered.update({'_masks':self._masks})
-            self._intered.dump()
+            self._interred.update({'_masks':self._masks})
+            self._interred.dump()
 
     def _unmask(self):
         """ resolve hierarchy: {new_val > interred > mask} """
-        if not self._intered:
+        if not self._interred:
             return
-        self._intered.load()
+        self._interred.load()
 
         try:
-            self._masks.update(self._intered.pop('_masks'))
+            self._masks.update(self._interred.pop('_masks'))
         except KeyError:
             pass
 
@@ -175,14 +178,26 @@ class Config(dict):
             current = self._nestread(key)
 
             if current != mask:
-                self._intered[key] = current
-                self._intered.dump() # write to protected YAML
-                self.dump()          # write to external YAML
+                self._interred[key] = current
+                self._interred.dump() # write to protected YAML
+                self.dump()           # write to external YAML
 
             try:
-                self._nestupdate(key,self._intered[key])
+                self._nestupdate(key,self._interred[key])
             except KeyError:
                 pass
+
+    def __repr__(self):
+        str = ('secret ' if self._allsecret else '') + f"config reading from {self._filepath}"
+        if self._interred:
+            str+= f"\nsecrets stored in {self._interred._filepath}"
+        if self._promiscuous:
+            str+= "\npromiscuous mode"
+        if self._verbose:
+            str+= "\nverbose mode"
+        str += "\nValues:\n"
+        str += super().__repr__()
+        return str
 
 with open(_Path(_os.path.abspath(_os.path.dirname(__file__))) / '__doc__','r') as _f:
     __doc__ = _f.read()

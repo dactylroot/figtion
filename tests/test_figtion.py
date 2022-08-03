@@ -74,15 +74,6 @@ class TestFigtion:
         intered = figtion.Config(description=figtion._MASK_FLAG,filepath=self.secretpath)
         assert(intered['password'] == 'supersecret')
 
-    def test_missing_encryption_key(self):
-        os.environ["FIGKEY"] = ""
-
-        try:
-            fig = figtion.Config(defaults=self.defaults,filepath=self.confpath,secretpath=self.secretpath)
-        except Exception as e:
-            assert( type(e) == OSError )
-            assert( str(e).startswith("Missing the encryption key for file"))
-
     def test_unencrypted_serialization(self):
         os.environ["FIGKEY"] = ""
 
@@ -97,6 +88,28 @@ class TestFigtion:
         newfig = figtion.Config(filepath=self.openpath)
         assert( newfig['password'] == self.defaults['password'] )
 
+    def test_explicit_promiscuous_mode(self):
+        fig = figtion.Config(promiscuous=True,filepath=self.confpath)
+
+        assert(fig['my server'] == 'www.bestsite.web')
+        assert(fig['number of nodes'] == 5)
+        assert( len(fig._masks) == 0 )
+
+    def test_implicit_promiscuous_mode(self):
+        fig = figtion.Config(filepath=self.confpath)
+
+        assert(fig['my server'] == 'www.bestsite.web')
+        assert(fig['number of nodes'] == 5)
+        assert( len(fig._masks) == 0 )
+
+    def test_promiscuous_with_secret(self):
+        fig = figtion.Config(promiscuous=True,filepath=self.confpath,secretpath=self.secretpath)
+
+        assert(fig['my server'] == 'www.bestsite.web')
+        assert(fig['number of nodes'] == 5)
+        assert(fig['password'] == self.defaults['password'] )
+        assert( len(fig._masks) == 1 )
+
     def test_only_secret(self):
         fig = figtion.Config(defaults=self.defaults,secretpath=self.secretpath)
 
@@ -107,6 +120,27 @@ class TestFigtion:
 
         try:
             fig = figtion.Config(defaults=self.defaults,secretpath=self.secretpath)
+        except Exception as e:
+            assert( type(e) == OSError )
+            assert( str(e).startswith("Missing the encryption key for file"))
+
+    def test_only_secret_explicit_promiscuous(self):
+        fig = figtion.Config(promiscuous=True,secretpath=self.secretpath)
+
+        assert( len(fig._masks) == 0 )
+        assert( fig['password'] == self.defaults['password'] )
+
+    def test_only_secret_implicit_promiscuous(self):
+        fig = figtion.Config(secretpath=self.secretpath)
+
+        assert( len(fig._masks) == 0 )
+        assert( fig['password'] == self.defaults['password'] )
+
+    def test_missing_encryption_key(self):
+        os.environ["FIGKEY"] = ""
+
+        try:
+            fig = figtion.Config(defaults=self.defaults,filepath=self.confpath,secretpath=self.secretpath)
         except Exception as e:
             assert( type(e) == OSError )
             assert( str(e).startswith("Missing the encryption key for file"))
