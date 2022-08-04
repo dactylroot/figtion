@@ -12,13 +12,14 @@
     `---^-^--^--^---`--' hjw
 
 
-A simple configuration interface with text file support
+A simple configuration interface with plaintext and encrypted file support.
 
 ## Benefits
 
   * seemless Python `dict` interface
     * unified config definition and defaults
   * YAML text file source for file-system input & serialization
+    * nested entries supported
   * simple precedence
     * `defaults` **keys** define config **keys**
     * YAML **values** override `defaults` **values**
@@ -35,12 +36,15 @@ A simple configuration interface with text file support
 
     defaults = {'my server'       : 'www.bestsite.web'
                ,'number of nodes' : 5
-               ,'password'        : 'huduyutakeme4' }
-    cfg = figtion.Config(defaults=defaults,filepath='~/conf.yml')
+               ,'password'        : 'huduyutakeme4'
+               ,'nested stuff'    : {'breakfast' : 'coffee'}
+               ,'listed stuff'    : ['a','b','c']}
+    
+    cfg = figtion.Config(defaults=defaults,filepath='./conf.yml')
 
     print(cfg['my server'])  
 
-This will print either '[_www.bestsite.web_](.)' or the value of 'my server' in `~/conf.yml` if it is something else.
+This will print either '[_www.bestsite.web_](.)' or the value of 'my server' in `./conf.yml` if it is something else.
 
 *defaults* strictly defines the schema. Only keys present in *defaults* from a serial file will be retained. If you want to risk unspecified input keys and load everything from the YAML file, you can either omit the *defaults* parameter or set `promiscuous=True` when constructing `Config`.
 

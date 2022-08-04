@@ -11,9 +11,12 @@ class Config(dict):
     def filepath(self):
         return self._filepath
 
-    def __init__(self,description = None, filepath = None, defaults = None, secretpath = None, verbose=True, promiscuous=False):
+    def __init__(self, filepath = None, defaults = None, secretpath = None, verbose=True, promiscuous=False, description = None):
         self.description = description if description else "configurations"
-        self._filepath = filepath
+        if filepath:
+            self._filepath = _os.path.abspath(_os.path.expanduser(filepath))
+        else:
+            self._filepath = None
         self._interred = None
         self._masks = {}
         self._verbose=verbose
@@ -22,7 +25,7 @@ class Config(dict):
 
         if secretpath:
             if not filepath:
-                self._filepath = secretpath
+                self._filepath = _os.path.abspath(_os.path.expanduser(secretpath))
                 self._allsecret = True
             else:
                 self._interred = Config(filepath=secretpath,description=_MASK_FLAG,promiscuous=True)
@@ -41,7 +44,7 @@ class Config(dict):
         self._mask()
 
         store = "%YAML 1.1\n---\n"
-        store += "# this file should be located at {}\n".format(_os.path.abspath(self.filepath))
+        store += "# this file should be located at {}\n".format(self.filepath)
         store += "\n\n"
         store += "###########################################################\n"
         store += "####{: ^50} ####\n".format(self.description)
@@ -120,9 +123,10 @@ class Config(dict):
             self._recursive_strict_update(self,newstuff)
             self._unmask()
         except Exception as e:
-            if self._verbose and hasattr(e,'strerror') and 'No such file' in e.strerror:
+            if hasattr(e,'strerror') and 'No such file' in e.strerror:
                 self.dump()
-                print(f"Initialized config file '{self.filepath}'")
+                if self._verbose:
+                    print(f"Initialized config file '{self.filepath}'")
             elif type(e) is UnicodeDecodeError:
                 raise OSError(f"Missing the encryption key for file '{self.filepath}'")
             else:
