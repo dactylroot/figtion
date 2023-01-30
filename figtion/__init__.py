@@ -54,6 +54,7 @@ class Config(dict):
         store += _yams
         store += "\n\n"
 
+        _os.makedirs(_Path(self.filepath).parent,exist_ok=True)
         key = self._getcipherkey()
         if key: # encrypt secrets before writing
             box = _secret.SecretBox(key)

@@ -6,7 +6,7 @@ with open('README.md') as f:
     long_description = f.read()
 
 name = 'figtion'
-version = '1.0.4'
+version = '1.0.5'
 
 ### include README as main package docfile
 from shutil import copyfile
@@ -15,13 +15,13 @@ copyfile(_workdir+'/README.md',_workdir+'/{0}/__doc__'.format(name))
 
 setup(name=name
     , version=version
-    , description='A simple configuration interface with text file support'
+    , description='A simple configuration interface with plaintext and encrypted file support.'
     , long_description=long_description
     , long_description_content_type='text/markdown'
-    , author = 'Michael Stewart'
-    , author_email = 'statueofmike@gmail.com'
-    , url='https://github.com/statueofmike/figtion'
-    , download_url="https://github.com/statueofmike/figtion/archive/{0}.tar.gz".format(version)
+    , author = 'Cory Root'
+    , author_email = 'dactylroot@gmail.com'
+    , url='https://github.com/dactylroot/figtion'
+    , download_url="https://github.com/dactylroot/figtion/archive/{0}.tar.gz".format(version)
     , license='MIT'
     , packages=['figtion']
     , include_package_data=True     # includes files from e.g. MANIFEST.in

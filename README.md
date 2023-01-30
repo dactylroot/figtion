@@ -39,7 +39,7 @@ A simple configuration interface with plaintext and encrypted file support.
                ,'password'        : 'huduyutakeme4'
                ,'nested stuff'    : {'breakfast' : 'coffee'}
                ,'listed stuff'    : ['a','b','c']}
-    
+
     cfg = figtion.Config(defaults=defaults,filepath='./conf.yml')
 
     print(cfg['my server'])  
@@ -77,4 +77,5 @@ This uses the *pynacl* bindings to the *libsodium* library, which uses [the XSal
 
   * 0.9 - secrets store in separate location
   * 1.0 - secrets store in encrypted location
-  * 1.1 - automatic/dynamic reloading of YAML files
+  * 1.1 - defaults explicitly separate from custom configs
+  * 1.2 - automatic/dynamic reloading of YAML files
