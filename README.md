@@ -78,4 +78,5 @@ This uses the *pynacl* bindings to the *libsodium* library, which uses [the XSal
   * 0.9 - secrets store in separate location
   * 1.0 - secrets store in encrypted location
   * 1.1 - defaults explicitly separate from custom configs
-  * 1.2 - automatic/dynamic reloading of YAML files
+  * 1.2 - support cascading configuration files
+  * 1.3 - automatic/dynamic reloading of YAML files

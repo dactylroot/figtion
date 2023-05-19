@@ -144,3 +144,30 @@ class TestFigtion:
         except Exception as e:
             assert( type(e) == OSError )
             assert( str(e).startswith("Missing the encryption key for file"))
+
+    def test_mask_nested_key(self):
+        try:
+
+            defaults = {'sub secret'      : {'password': 'huduyutakeme4' }}
+
+            fig = figtion.Config(defaults=defaults,filepath=self.confpath,secretpath=self.secretpath)
+            fig.mask('sub secret.password')
+        except Exception as e:
+            assert( type(e) == KeyError )
+            assert( str(e).startswith("'password'"))
+
+    def test_mask_nonexistent_secretpath(self):
+        try:
+            fig = figtion.Config(defaults=self.defaults,filepath=self.confpath)
+            fig.mask('nonexistent')
+        except Exception as e:
+            assert( type(e) == Exception )
+            assert( str(e).startswith('Cannot mask without a secretpath serializing path.'))
+
+    def test_mask_nonexistent_key(self):
+        try:
+            fig = figtion.Config(defaults=self.defaults,filepath=self.confpath,secretpath=self.secretpath)
+            fig.mask('nonexistent')
+        except Exception as e:
+            assert( type(e) == KeyError )
+            assert( str(e).startswith("'nonexistent'"))
