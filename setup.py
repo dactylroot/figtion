@@ -6,7 +6,7 @@ with open('README.md') as f:
     long_description = f.read()
 
 name = 'figtion'
-version = '1.0.5'
+version = '1.1.0'
 
 ### include README as main package docfile
 from shutil import copyfile
@@ -28,9 +28,13 @@ setup(name=name
     , classifiers=[
         'Development Status :: 5 - Production/Stable',
         'License :: OSI Approved :: MIT License',
-        'Programming Language :: Python :: 3'
+        'Programming Language :: Python :: 3',
+        'Topic :: Home Automation',
+        'Topic :: Software Development :: Embedded Systems',
+        'Topic :: Security',
+        'Topic :: Security :: Cryptography'
       ]
-    , keywords='configuration secret'
+    , keywords='configuration secret raspberry pi embedded iot'
     , install_requires=['pyyaml','pynacl']
     , python_requires='>=3.5'
     , zip_safe=False

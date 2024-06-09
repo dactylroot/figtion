@@ -48,6 +48,36 @@ This will print either '[_www.bestsite.web_](.)' or the value of 'my server' in 
 
 *defaults* strictly defines the schema. Only keys present in *defaults* from a serial file will be retained. If you want to risk unspecified input keys and load everything from the YAML file, you can either omit the *defaults* parameter or set `promiscuous=True` when constructing `Config`.
 
+### Self-Documenting Plaintext
+
+Specify if/when you want to update stored plaintext file.
+
+    cfg = figtion.Config(..., promiscuous=True)
+    ...
+    cfg.dump()
+
+If `concise=True`, only modified values are stored in text file.
+If `promiscuous=False` (default behavior), deprecated values are quietly removed.
+Otherwise, serialized YAML will clarify default, modified, and deprecated values:
+    
+	##############################
+	####       Modified       ####
+	##############################
+	my server: www.newsite.web
+
+
+	##############################
+	####       Default        ####
+	##############################
+	number of nodes: 5
+
+
+	##############################
+	####      Deprecated      ####
+	##############################
+	fave cat: Zelda
+
+
 ### Config Secrets
 
 When you want a public config file and a separate secret one.
@@ -77,6 +107,6 @@ This uses the *pynacl* bindings to the *libsodium* library, which uses [the XSal
 
   * 0.9 - secrets store in separate location
   * 1.0 - secrets store in encrypted location
-  * 1.1 - defaults explicitly separate from custom configs
-  * 1.2 - support cascading configuration files
-  * 1.3 - automatic/dynamic reloading of YAML files
+  * 1.1 - make default, modified, and unused properties explicit in plaintext
+  * 1.? - automatic/dynamic reloading of YAML files
+  * 1.? - support cascading configuration files

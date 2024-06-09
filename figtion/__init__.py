@@ -11,15 +11,17 @@ class Config(dict):
     def filepath(self):
         return self._filepath
 
-    def __init__(self, filepath = None, defaults = None, secretpath = None, verbose=True, promiscuous=False, description = None):
+    def __init__(self, filepath = None, defaults = None, secretpath = None, verbose=True, promiscuous=False, description = None, concise=False):
         self.description = description if description else "configurations"
         if filepath:
             self._filepath = _os.path.abspath(_os.path.expanduser(filepath))
         else:
             self._filepath = None
+        self._defaults = defaults
         self._interred = None
         self._masks = {}
         self._verbose=verbose
+        self._concise=concise
         self._allsecret = description == _MASK_FLAG
         self._promiscuous = promiscuous or (not defaults)
 
@@ -43,17 +45,46 @@ class Config(dict):
 
         self._mask()
 
-        store = "%YAML 1.1\n---\n"
-        store += "# this file should be located at {}\n".format(self.filepath)
-        store += "\n\n"
-        store += "###########################################################\n"
-        store += "####{: ^50} ####\n".format(self.description)
-        store += "###########################################################\n"
-        store += "\n\n"
-        _yams = _yaml.dump(dict(self.items()),default_flow_style=False,indent=4)
-        store += _yams
-        store += "\n\n"
+        used       = [k for k in self.keys() if k in self._defaults.keys()]
+        modified   = {k:self[k] for k in used if self[k] != self._defaults[k]}
+        unmodified = {k:self[k] for k in used if self[k] == self._defaults[k]}
+        deprecated = {k:self[k] for k in self.keys() if k not in self._defaults.keys()}
 
+        store = "%YAML 1.1\n---\n"
+        _yams = _yaml.dump(modified,default_flow_style=False,indent=4)
+        if self._concise:
+            store += _yams
+        else:
+            store += "# this file should be located at {}\n".format(self.filepath)
+            store += "\n\n"
+            store += "############################################################\n"
+            store += "#### {: ^50} ####\n".format(self.description)
+            store += "############################################################\n"
+            store += "\n\n"
+
+            store += "##############################\n"
+            store += "#### {: ^20} ####\n".format('Modified')
+            store += "##############################\n"
+            store += _yams
+            store += "\n\n"
+
+            if unmodified and not self._concise:
+                store += "##############################\n"
+                store += "#### {: ^20} ####\n".format('Default')
+                store += "##############################\n"
+                _yams = _yaml.dump(unmodified,default_flow_style=False,indent=4)
+                store += _yams
+                store += "\n\n"
+
+            if deprecated and not self._concise:
+                store += "##############################\n"
+                store += "#### {: ^20} ####\n".format('Deprecated')
+                store += "##############################\n"
+                _yams = _yaml.dump(deprecated,default_flow_style=False,indent=4)
+                store += _yams
+                store += "\n\n"
+
+        # Store encrypted values
         _os.makedirs(_Path(self.filepath).parent,exist_ok=True)
         key = self._getcipherkey()
         if key: # encrypt secrets before writing
@@ -73,10 +104,10 @@ class Config(dict):
             This defines behavior when there is a "schema change".
             a corresponds to canon schema.
             b corresponds to serialized (potentially outdated) YAML file:
-              * only items defined in 'a' are kept
-              * 'promiscuous' mode: items defined in 'b' are also kept
-              * values present in 'b' are given priority
-         """
+              * values present in 'b' preside
+              * 'promiscuous=False': only items defined in 'a' are kept
+              * 'promiscuous=True' : items defined in 'b' are also kept
+        """
         if not a:
             a.update(b)
             return
@@ -134,6 +165,7 @@ class Config(dict):
                 raise e
 
     def _nestupdate(self,key,val):
+        # TODO: cleanup use of existing dict accessors and inherit
         cfg = self
         key = key.split('.')
         if len(key) > 1:
@@ -147,7 +179,9 @@ class Config(dict):
             return self[key]
 
     def mask(self,cfg_key,mask='*****'):
-        """ Good for sensitive credentials.
+        """ Separate flagged variables for storage.
+            Replace flagged variables with mask value.
+            Good for sensitive credentials.
             Mask is serialized to `self.filepath`.
             True value serialized to `self.secretpath`. """
         if self._interred is None:
