@@ -65,7 +65,7 @@ class Config(dict):
             store += "##############################\n"
             store += "#### {: ^20} ####\n".format('Modified')
             store += "##############################\n"
-            store += _yams
+            store += _yams if modified else ""
             store += "\n\n"
 
             if unmodified and not self._concise:
