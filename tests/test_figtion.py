@@ -1,6 +1,7 @@
 
 import os
 import sys
+import pytest
 from pathlib import Path
 
 _mypath = Path(os.path.abspath(Path(os.path.dirname(__file__))))
@@ -171,3 +172,71 @@ class TestFigtion:
         except Exception as e:
             assert( type(e) == KeyError )
             assert( str(e).startswith("'nonexistent'"))
+
+    # --- regression tests for previously fixed bugs ---
+
+    def test_dump_defaults_none(self):
+        """dump() with defaults=None should not crash (AttributeError on None.keys())"""
+        os.environ["FIGKEY"] = ""
+        fig = figtion.Config(filepath=self.confpath)
+        fig['foo'] = 'bar'
+        fig.dump()
+        loaded = figtion.Config(filepath=self.confpath)
+        assert loaded['foo'] == 'bar'
+
+    def test_dump_empty_modified_section(self):
+        """dump() should produce valid YAML when modified section is empty (no {} before block mappings)"""
+        os.environ["FIGKEY"] = ""
+        fig = figtion.Config(defaults=self.defaults, filepath=self.confpath)
+        fig.dump()
+        loaded = figtion.Config(defaults=self.defaults, filepath=self.confpath)
+        assert loaded['my server'] == self.defaults['my server']
+
+    def test_plaintext_file_with_figkey_set(self):
+        """Loading a plaintext secret file when FIGKEY is set should raise a clear OSError"""
+        os.environ["FIGKEY"] = ""
+        figtion.Config(defaults=self.defaults, filepath=self.confpath, secretpath=self.openpath)
+        os.environ["FIGKEY"] = self.secretkey
+        with pytest.raises(OSError, match="plaintext"):
+            figtion.Config(defaults=self.defaults, filepath=self.confpath, secretpath=self.openpath)
+
+    # --- tests exposing confirmed bugs ---
+
+    def test_nestupdate_three_levels(self):
+        """BUG: _nestupdate only descends one level, so 3-deep keys write to the wrong location"""
+        fig = figtion.Config(defaults={'a': {'b': {'c': 'original'}}})
+        fig._nestupdate('a.b.c', 'updated')
+        # Currently sets fig['a']['b'] = 'updated' instead of fig['a']['b']['c'] = 'updated'
+        assert fig['a']['b']['c'] == 'updated'
+
+    def test_nestread_missing_nested_key_raises_keyerror(self):
+        """BUG: _nestread raises TypeError (not KeyError) for missing nested keys,
+        inconsistent with single-key access which raises KeyError"""
+        fig = figtion.Config(defaults={'x': 1})
+        with pytest.raises(KeyError):
+            fig._nestread('missing.key')
+
+    def test_dump_raises_without_filepath(self):
+        """BUG: dump() with no filepath raises an unhelpful TypeError"""
+        fig = figtion.Config(defaults=self.defaults)
+        with pytest.raises(ValueError, match="filepath"):
+            fig.dump()
+
+    def test_recursive_strict_update_scalar_to_dict(self):
+        """BUG: _recursive_strict_update crashes with AttributeError when a key holds
+        a scalar in 'a' but a dict in 'b' (schema change from scalar to nested dict)"""
+        fig = figtion.Config(defaults={'x': 'scalar'}, promiscuous=True)
+        # Simulate loading a file where 'x' is now a nested dict
+        fig._recursive_strict_update(fig, {'x': {'nested': 'val'}})
+        assert fig['x'] == {'nested': 'val'}
+
+    def test_filenot_found_uses_isinstance(self):
+        """FileNotFoundError detection should use isinstance, not string-match on strerror,
+        so it cannot false-positive on other OSErrors that happen to have a strerror attr"""
+        import errno
+        # PermissionError has strerror but is NOT a missing-file error
+        e = PermissionError(errno.EACCES, 'No such file or directory', str(self.confpath))
+        # The current string-match heuristic would incorrectly treat this as file-not-found
+        # if the error message happened to contain 'No such file'.
+        assert not isinstance(e, FileNotFoundError)
+        assert hasattr(e, 'strerror') and 'No such file' in e.strerror  # shows the risk

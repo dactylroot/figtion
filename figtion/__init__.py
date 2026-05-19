@@ -1,8 +1,8 @@
 import os as _os
 import yaml as _yaml
 from pathlib import Path as _Path
-from functools import reduce as _reduce
 import nacl.secret as _secret
+import nacl.exceptions as _nacl_exc
 
 _MASK_FLAG = "masked configs"
 
@@ -42,13 +42,16 @@ class Config(dict):
         """ Serialize to YAML """
         if filepath:
             self._filepath = filepath
+        if not self._filepath:
+            raise ValueError("dump() requires a filepath")
 
         self._mask()
 
-        used       = [k for k in self.keys() if k in self._defaults.keys()]
+        default_keys = set(self._defaults.keys()) if self._defaults else set()
+        used       = [k for k in self.keys() if k in default_keys]
         modified   = {k:self[k] for k in used if self[k] != self._defaults[k]}
         unmodified = {k:self[k] for k in used if self[k] == self._defaults[k]}
-        deprecated = {k:self[k] for k in self.keys() if k not in self._defaults.keys()}
+        deprecated = {k:self[k] for k in self.keys() if k not in default_keys}
 
         store = "%YAML 1.1\n---\n"
         _yams = _yaml.dump(modified,default_flow_style=False,indent=4)
@@ -65,7 +68,8 @@ class Config(dict):
             store += "##############################\n"
             store += "#### {: ^20} ####\n".format('Modified')
             store += "##############################\n"
-            store += _yams
+            if modified:
+                store += _yams
             store += "\n\n"
 
             if unmodified and not self._concise:
@@ -116,7 +120,7 @@ class Config(dict):
 
         for key in b.keys():
             if isinstance(b[key],dict):
-                if not key in a.keys():
+                if not isinstance(a.get(key), dict):
                     a[key] = {}
                 self._recursive_strict_update(a[key],b[key])
             elif key in a.keys() or self._promiscuous:
@@ -155,28 +159,29 @@ class Config(dict):
             self._recursive_strict_update(self,newstuff)
             self._unmask()
         except Exception as e:
-            if hasattr(e,'strerror') and 'No such file' in e.strerror:
+            if isinstance(e, FileNotFoundError):
                 self.dump()
                 if self._verbose:
                     print(f"Initialized config file '{self.filepath}'")
             elif type(e) is UnicodeDecodeError:
                 raise OSError(f"Missing the encryption key for file '{self.filepath}'")
+            elif isinstance(e, _nacl_exc.CryptoError):
+                raise OSError(f"Decryption failed for '{self.filepath}': file may be plaintext but FIGKEY is set")
             else:
                 raise e
 
     def _nestupdate(self,key,val):
-        # TODO: cleanup use of existing dict accessors and inherit
         cfg = self
-        key = key.split('.')
-        if len(key) > 1:
-            cfg = cfg[key.pop(0)]
-        cfg[key[0]] = val
+        parts = key.split('.')
+        for segment in parts[:-1]:
+            cfg = cfg[segment]
+        cfg[parts[-1]] = val
 
     def _nestread(self,key):
-        if len(key.split('.')) > 1:
-            return _reduce(dict.get, key.split('.'), self)
-        else:
-            return self[key]
+        cfg = self
+        for part in key.split('.'):
+            cfg = cfg[part]
+        return cfg
 
     def mask(self,cfg_key,mask='*****'):
         """ Separate flagged variables for storage.
