@@ -3,6 +3,7 @@ import yaml as _yaml
 from pathlib import Path as _Path
 from functools import reduce as _reduce
 import nacl.secret as _secret
+import nacl.exceptions as _nacl_exc
 
 _MASK_FLAG = "masked configs"
 
@@ -45,10 +46,11 @@ class Config(dict):
 
         self._mask()
 
-        used       = [k for k in self.keys() if k in self._defaults.keys()]
+        default_keys = set(self._defaults.keys()) if self._defaults else set()
+        used       = [k for k in self.keys() if k in default_keys]
         modified   = {k:self[k] for k in used if self[k] != self._defaults[k]}
         unmodified = {k:self[k] for k in used if self[k] == self._defaults[k]}
-        deprecated = {k:self[k] for k in self.keys() if k not in self._defaults.keys()}
+        deprecated = {k:self[k] for k in self.keys() if k not in default_keys}
 
         store = "%YAML 1.1\n---\n"
         _yams = _yaml.dump(modified,default_flow_style=False,indent=4)
@@ -65,7 +67,8 @@ class Config(dict):
             store += "##############################\n"
             store += "#### {: ^20} ####\n".format('Modified')
             store += "##############################\n"
-            store += _yams
+            if modified:
+                store += _yams
             store += "\n\n"
 
             if unmodified and not self._concise:
@@ -161,6 +164,8 @@ class Config(dict):
                     print(f"Initialized config file '{self.filepath}'")
             elif type(e) is UnicodeDecodeError:
                 raise OSError(f"Missing the encryption key for file '{self.filepath}'")
+            elif isinstance(e, _nacl_exc.CryptoError):
+                raise OSError(f"Decryption failed for '{self.filepath}': file may be plaintext but FIGKEY is set")
             else:
                 raise e
 
