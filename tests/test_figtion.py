@@ -332,6 +332,36 @@ class TestFigtion:
         _ = fig['my server']
         assert fig.changed is False
 
+    def test_mask_nested_update_zero_reload_no_recursion(self):
+        """Updating a masked nested value when reload_interval=0 must not raise
+        RecursionError.  Root cause: _nestread/_nestupdate called Config.__getitem__,
+        which triggered _maybe_reload() during _mask()/_unmask(); the mtime always
+        differed (we just wrote the file), so load() -> _unmask() -> dump() looped
+        infinitely.  Fixed by using dict.__getitem__ inside _nestread/_nestupdate."""
+        os.environ["FIGKEY"] = ""
+        defaults = {'api_keys': {'secret': '', 'token': ''}}
+        fig = figtion.Config(defaults=defaults, filepath=self.confpath,
+                             secretpath=self.openpath, reload_interval=0)
+        fig['api_keys']['secret'] = 'initial_secret'
+        fig['api_keys']['token']  = 'initial_token'
+        fig.mask('api_keys.secret')
+        fig.mask('api_keys.token')
+
+        # Simulate replacing the whole sub-dict then re-masking — the pattern
+        # used by update_api_keys() in the renewals app that surfaced this bug.
+        fig['api_keys'] = {'secret': 'new_secret', 'token': 'new_token'}
+        fig.mask('api_keys.secret')  # raised RecursionError before the fix
+        fig.mask('api_keys.token')
+
+        assert fig['api_keys']['secret'] == 'new_secret'
+        assert fig['api_keys']['token']  == 'new_token'
+
+        # Masked value must be hidden in the serialized conf file.
+        with open(self.confpath) as f:
+            conf_text = f.read()
+        assert 'new_secret' not in conf_text
+        assert 'new_token'  not in conf_text
+
     def test_filenot_found_uses_isinstance(self):
         """FileNotFoundError detection should use isinstance, not string-match on strerror,
         so it cannot false-positive on other OSErrors that happen to have a strerror attr"""

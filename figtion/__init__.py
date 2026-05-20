@@ -41,6 +41,9 @@ class Config(dict):
         self._last_check = _time.monotonic()
         self._file_mtimes = {}
         self._reloading = True
+        ### Depth counter incremented during dump()/_mask()/_unmask() to suppress
+        ### _maybe_reload() re-entry while mask/unmask operations are in flight.
+        self._masking = 0
 
         if secretpath:
             if not filepath:
@@ -66,61 +69,72 @@ class Config(dict):
         if not self._filepath:
             raise ValueError("dump() requires a filepath")
 
-        self._mask()
+        ### Suppress _maybe_reload() for the mask + write phase so that dict
+        ### accesses inside _mask() and the list comprehensions below (self.keys(),
+        ### self[k]) do not trigger a file reload — which would recurse back into
+        ### _unmask() → dump() infinitely when reload_interval=0.
+        self._masking += 1
+        try:
+            self._mask()
 
-        default_keys = set(self._defaults.keys()) if self._defaults else set()
-        used       = [k for k in self.keys() if k in default_keys]
-        modified   = {k:self[k] for k in used if self[k] != self._defaults[k]}
-        unmodified = {k:self[k] for k in used if self[k] == self._defaults[k]}
-        deprecated = {k:self[k] for k in self.keys() if k not in default_keys}
+            default_keys = set(self._defaults.keys()) if self._defaults else set()
+            used       = [k for k in self.keys() if k in default_keys]
+            modified   = {k:self[k] for k in used if self[k] != self._defaults[k]}
+            unmodified = {k:self[k] for k in used if self[k] == self._defaults[k]}
+            deprecated = {k:self[k] for k in self.keys() if k not in default_keys}
 
-        store = "%YAML 1.1\n---\n"
-        _yams = _yaml.dump(modified,default_flow_style=False,indent=4)
-        if self._concise:
-            store += _yams
-        else:
-            store += "# this file should be located at {}\n".format(self.filepath)
-            store += "\n\n"
-            store += "############################################################\n"
-            store += "#### {: ^50} ####\n".format(self.description)
-            store += "############################################################\n"
-            store += "\n\n"
-
-            store += "##############################\n"
-            store += "#### {: ^20} ####\n".format('Modified')
-            store += "##############################\n"
-            if modified:
+            store = "%YAML 1.1\n---\n"
+            _yams = _yaml.dump(modified,default_flow_style=False,indent=4)
+            if self._concise:
                 store += _yams
-            store += "\n\n"
-
-            if unmodified and not self._concise:
-                store += "##############################\n"
-                store += "#### {: ^20} ####\n".format('Default')
-                store += "##############################\n"
-                _yams = _yaml.dump(unmodified,default_flow_style=False,indent=4)
-                store += _yams
+            else:
+                store += "# this file should be located at {}\n".format(self.filepath)
+                store += "\n\n"
+                store += "############################################################\n"
+                store += "#### {: ^50} ####\n".format(self.description)
+                store += "############################################################\n"
                 store += "\n\n"
 
-            if deprecated and not self._concise:
                 store += "##############################\n"
-                store += "#### {: ^20} ####\n".format('Deprecated')
+                store += "#### {: ^20} ####\n".format('Modified')
                 store += "##############################\n"
-                _yams = _yaml.dump(deprecated,default_flow_style=False,indent=4)
-                store += _yams
+                if modified:
+                    store += _yams
                 store += "\n\n"
 
-        # Store encrypted values
-        _os.makedirs(_Path(self.filepath).parent,exist_ok=True)
-        key = self._getcipherkey()
-        if key: # encrypt secrets before writing
-            box = _secret.SecretBox(key)
+                if unmodified and not self._concise:
+                    store += "##############################\n"
+                    store += "#### {: ^20} ####\n".format('Default')
+                    store += "##############################\n"
+                    _yams = _yaml.dump(unmodified,default_flow_style=False,indent=4)
+                    store += _yams
+                    store += "\n\n"
 
-            store = box.encrypt(store.encode())
-            with open(self.filepath,'wb') as ymlfile:
-                ymlfile.write(store.nonce + store.ciphertext)
-        else:
-            with open(self.filepath,'w') as ymlfile:
-                ymlfile.write(store)
+                if deprecated and not self._concise:
+                    store += "##############################\n"
+                    store += "#### {: ^20} ####\n".format('Deprecated')
+                    store += "##############################\n"
+                    _yams = _yaml.dump(deprecated,default_flow_style=False,indent=4)
+                    store += _yams
+                    store += "\n\n"
+
+            # Store encrypted values
+            _os.makedirs(_Path(self.filepath).parent,exist_ok=True)
+            key = self._getcipherkey()
+            if key: # encrypt secrets before writing
+                box = _secret.SecretBox(key)
+
+                store = box.encrypt(store.encode())
+                with open(self.filepath,'wb') as ymlfile:
+                    ymlfile.write(store.nonce + store.ciphertext)
+            else:
+                with open(self.filepath,'w') as ymlfile:
+                    ymlfile.write(store)
+        finally:
+            self._masking -= 1
+            ### Refresh mtimes so the _maybe_reload() check in _unmask() (and on
+            ### the next dict access) does not see a spurious change and re-trigger.
+            self._refresh_mtimes()
 
         self._unmask()
 
@@ -210,7 +224,7 @@ class Config(dict):
         """ If reload_interval has elapsed since last check, compare source
             file mtimes; on change, reload and set `changed` if any value
             actually differs. Guarded against reentry from load()/_unmask(). """
-        if self._reloading or self._reload_interval is None:
+        if self._reloading or self._reload_interval is None or self._masking:
             return
         now = _time.monotonic()
         if now - self._last_check < self._reload_interval:
@@ -278,13 +292,13 @@ class Config(dict):
         cfg = self
         parts = key.split('.')
         for segment in parts[:-1]:
-            cfg = cfg[segment]
-        cfg[parts[-1]] = val
+            cfg = dict.__getitem__(cfg, segment)
+        dict.__setitem__(cfg, parts[-1], val)
 
     def _nestread(self,key):
         cfg = self
         for part in key.split('.'):
-            cfg = cfg[part]
+            cfg = dict.__getitem__(cfg, part)
         return cfg
 
     def mask(self,cfg_key,mask='*****'):
