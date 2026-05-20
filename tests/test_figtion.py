@@ -1,6 +1,7 @@
 
 import os
 import sys
+import time
 import pytest
 from pathlib import Path
 
@@ -270,6 +271,66 @@ class TestFigtion:
         # Simulate loading a file where 'x' is now a nested dict
         fig._recursive_strict_update(fig, {'x': {'nested': 'val'}})
         assert fig['x'] == {'nested': 'val'}
+
+    def test_dynamic_reload_sets_changed_flag(self):
+        """Modifying the source YAML after construction should trigger a
+        reload on next access and set `changed=True` when values differ."""
+        os.environ["FIGKEY"] = ""
+        fig = figtion.Config(defaults=self.defaults, filepath=self.confpath, reload_interval=0)
+        assert fig['my server'] == 'www.bestsite.web'
+        assert fig.changed is False
+
+        # Rewrite the source file with a new value; bump mtime to be safe.
+        with open(self.confpath, 'w') as f:
+            f.write("%YAML 1.1\n---\nmy server: www.othersite.web\n")
+        os.utime(self.confpath, (time.time() + 1, time.time() + 1))
+
+        # Next read triggers a reload (interval=0 means "always check").
+        assert fig['my server'] == 'www.othersite.web'
+        assert fig.changed is True
+
+        # User clears the flag after handling the change.
+        fig.changed = False
+        # Untouched file: subsequent reads do not re-set the flag.
+        _ = fig['my server']
+        assert fig.changed is False
+
+    def test_dynamic_reload_interval_gates_check(self):
+        """A non-zero reload_interval should suppress checks until elapsed."""
+        os.environ["FIGKEY"] = ""
+        fig = figtion.Config(defaults=self.defaults, filepath=self.confpath, reload_interval=60)
+
+        with open(self.confpath, 'w') as f:
+            f.write("%YAML 1.1\n---\nmy server: www.othersite.web\n")
+        os.utime(self.confpath, (time.time() + 1, time.time() + 1))
+
+        # Within the 60-second window, no reload happens.
+        assert fig['my server'] == 'www.bestsite.web'
+        assert fig.changed is False
+
+    def test_dynamic_reload_disabled_with_none(self):
+        """reload_interval=None disables the feature entirely."""
+        os.environ["FIGKEY"] = ""
+        fig = figtion.Config(defaults=self.defaults, filepath=self.confpath, reload_interval=None)
+
+        with open(self.confpath, 'w') as f:
+            f.write("%YAML 1.1\n---\nmy server: www.othersite.web\n")
+        os.utime(self.confpath, (time.time() + 1, time.time() + 1))
+
+        assert fig['my server'] == 'www.bestsite.web'
+        assert fig.changed is False
+
+    def test_dynamic_reload_no_flag_when_only_mtime_changes(self):
+        """Touching the file without changing content should not flip `changed`."""
+        os.environ["FIGKEY"] = ""
+        fig = figtion.Config(defaults=self.defaults, filepath=self.confpath, reload_interval=0)
+        _ = fig['my server']
+
+        # Bump mtime but leave content alone by re-dumping the same config.
+        os.utime(self.confpath, (time.time() + 1, time.time() + 1))
+
+        _ = fig['my server']
+        assert fig.changed is False
 
     def test_filenot_found_uses_isinstance(self):
         """FileNotFoundError detection should use isinstance, not string-match on strerror,

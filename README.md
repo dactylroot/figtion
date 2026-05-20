@@ -20,6 +20,7 @@ A simple configuration interface with plaintext and encrypted file support.
     * unified config definition and defaults
   * YAML text file source for file-system input & serialization
     * nested entries supported
+    * optional live reloading
   * simple precedence
     * `defaults` **keys** define config **keys**
     * YAML **values** override `defaults` **values**
@@ -77,6 +78,20 @@ Otherwise, serialized YAML will clarify default, modified, and deprecated values
 	##############################
 	fave cat: Zelda
 
+### Dynamic Reloading
+
+    cfg = figtion.Config(defaults=defaults, filepath='./conf.yml', reload_interval=5)
+
+    # ...some time later, after ./conf.yml has been edited externally...
+    value = cfg['my server']   # triggers an mtime check; reloads if changed
+
+    if cfg.changed:
+        # propagate the new values to your application, then clear the flag
+        restart_workers()
+        cfg.changed = False
+
+`reload_interval` is in seconds and defaults to `5`. Pass `0` to check on every read, or `None` to disable dynamic reloading entirely.
+The `changed` flag is only set when an actual value differs after reload. Touching the file without changing content will not flip it.
 
 ### Config Secrets
 
@@ -104,10 +119,10 @@ In this case, no call to `mask` is needed and everything is encrypted at rest.
 This uses the *pynacl* bindings to the *libsodium* library, which uses [the XSalsa20 algorithm](https://libsodium.gitbook.io/doc/advanced/stream_ciphers/xsalsa20) for encryption. The encryption key provided by the *FIGKEY* environment variable is truncated to a 32-byte string.
 
 ## Roadmap
-  * 1.? - automatic/dynamic reloading of YAML files
   * 1.? - support cascading configuration files
 
 ## Changelog
+  * 1.2 - automatic+dynamic reloading of YAML files
   * 1.1 - make default, modified, and unused properties explicit in plaintext
   * 1.0 - secrets store in encrypted location
   * 0.9 - secrets store in separate location

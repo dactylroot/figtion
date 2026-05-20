@@ -1,5 +1,6 @@
 import os as _os
 import copy as _copy
+import time as _time
 import yaml as _yaml
 from pathlib import Path as _Path
 import nacl.secret as _secret
@@ -8,11 +9,15 @@ import nacl.exceptions as _nacl_exc
 _MASK_FLAG = "masked configs"
 
 class Config(dict):
+    ### Public flag: set to True when a dynamic reload pulled in new values.
+    ### The user is responsible for observing and clearing this flag.
+    changed = False
+
     @property
     def filepath(self):
         return self._filepath
 
-    def __init__(self, filepath = None, defaults = None, secretpath = None, verbose=True, promiscuous=False, description = None, concise=False):
+    def __init__(self, filepath = None, defaults = None, secretpath = None, verbose=True, promiscuous=False, description = None, concise=False, reload_interval=5):
         self.description = description if description else "configurations"
         if filepath:
             self._filepath = _os.path.abspath(_os.path.expanduser(filepath))
@@ -27,18 +32,32 @@ class Config(dict):
         self._allsecret = description == _MASK_FLAG
         self._promiscuous = promiscuous or (not defaults)
 
+        ### Dynamic reload state. The public `changed` class attribute is
+        ### the user-observable flag (declared at class scope above).
+        ### `_reloading` starts True so that overridden read methods invoked
+        ### during init (via load()/_recursive_strict_update) skip the reload
+        ### check until construction is complete.
+        self._reload_interval = reload_interval
+        self._last_check = _time.monotonic()
+        self._file_mtimes = {}
+        self._reloading = True
+
         if secretpath:
             if not filepath:
                 self._filepath = _os.path.abspath(_os.path.expanduser(secretpath))
                 self._allsecret = True
             else:
-                self._interred = Config(filepath=secretpath,description=_MASK_FLAG,promiscuous=True)
+                ### Inner secrets Config: disable its own reload checking;
+                ### the outer Config drives reloads for both files.
+                self._interred = Config(filepath=secretpath,description=_MASK_FLAG,promiscuous=True,reload_interval=None)
 
         ### Precedence of YAML over defaults
         if defaults:
             self.update(_copy.deepcopy(defaults))
         if self._filepath:
             self.load()
+        self._refresh_mtimes()
+        self._reloading = False
 
     def dump(self,filepath=None):
         """ Serialize to YAML """
@@ -171,6 +190,89 @@ class Config(dict):
                 raise OSError(f"Decryption failed for '{self.filepath}': file may be plaintext but FIGKEY is set")
             else:
                 raise e
+
+    def _watched_files(self):
+        files = []
+        if self._filepath:
+            files.append(self._filepath)
+        if self._interred and self._interred._filepath:
+            files.append(self._interred._filepath)
+        return files
+
+    def _refresh_mtimes(self):
+        for fp in self._watched_files():
+            try:
+                self._file_mtimes[fp] = _os.path.getmtime(fp)
+            except OSError:
+                self._file_mtimes[fp] = None
+
+    def _maybe_reload(self):
+        """ If reload_interval has elapsed since last check, compare source
+            file mtimes; on change, reload and set `changed` if any value
+            actually differs. Guarded against reentry from load()/_unmask(). """
+        if self._reloading or self._reload_interval is None:
+            return
+        now = _time.monotonic()
+        if now - self._last_check < self._reload_interval:
+            return
+        self._last_check = now
+
+        file_changed = False
+        for fp in self._watched_files():
+            try:
+                mtime = _os.path.getmtime(fp)
+            except OSError:
+                continue
+            if mtime != self._file_mtimes.get(fp):
+                file_changed = True
+                break
+        if not file_changed:
+            return
+
+        self._reloading = True
+        try:
+            ### Snapshot under guard so dict(self)'s iteration doesn't recurse.
+            before = _copy.deepcopy(dict(self))
+            self.load()
+            after = dict(self)
+        finally:
+            self._reloading = False
+        ### Refresh after load: dump()s triggered inside _unmask() bump mtimes.
+        self._refresh_mtimes()
+        if after != before:
+            self.changed = True
+
+    def __getitem__(self, key):
+        self._maybe_reload()
+        return super().__getitem__(key)
+
+    def __contains__(self, key):
+        self._maybe_reload()
+        return super().__contains__(key)
+
+    def get(self, key, default=None):
+        self._maybe_reload()
+        return super().get(key, default)
+
+    def keys(self):
+        self._maybe_reload()
+        return super().keys()
+
+    def values(self):
+        self._maybe_reload()
+        return super().values()
+
+    def items(self):
+        self._maybe_reload()
+        return super().items()
+
+    def __iter__(self):
+        self._maybe_reload()
+        return super().__iter__()
+
+    def __len__(self):
+        self._maybe_reload()
+        return super().__len__()
 
     def _nestupdate(self,key,val):
         cfg = self
