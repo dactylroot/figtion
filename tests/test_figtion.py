@@ -200,6 +200,15 @@ class TestFigtion:
         with pytest.raises(OSError, match="plaintext"):
             figtion.Config(defaults=self.defaults, filepath=self.confpath, secretpath=self.openpath)
 
+    def test_short_file_nonce_error(self):
+        """A secret file shorter than 24 bytes raises nacl.exceptions.ValueError (bad nonce size);
+        should surface as OSError, not a raw nacl exception"""
+        os.environ["FIGKEY"] = self.secretkey
+        with open(self.secretpath, 'wb') as f:
+            f.write(b'tooshort')  # < 24-byte NONCE_SIZE
+        with pytest.raises(OSError):
+            figtion.Config(defaults=self.defaults, filepath=self.confpath, secretpath=self.secretpath)
+
     # --- tests exposing confirmed bugs ---
 
     def test_nestupdate_three_levels(self):
@@ -221,6 +230,38 @@ class TestFigtion:
         fig = figtion.Config(defaults=self.defaults)
         with pytest.raises(ValueError, match="filepath"):
             fig.dump()
+
+    def test_recursive_strict_update_empty_a_none_b(self):
+        """Empty config + None from an empty YAML file should not raise TypeError on a.update(None)"""
+        fig = figtion.Config()
+        fig._recursive_strict_update(fig, None)
+        assert len(fig) == 0
+
+    def test_defaults_not_shared_with_self_for_nested_dicts(self):
+        """Nested-dict defaults must be deep-copied so mutations to self don't
+        poison self._defaults or the caller's dict."""
+        original = {'section': {'key': 'original'}}
+        fig = figtion.Config(defaults=original, promiscuous=True)
+        fig['section']['key'] = 'changed'
+        assert original['section']['key'] == 'original'
+        assert fig._defaults['section']['key'] == 'original'
+        assert fig['section']['key'] == 'changed'
+
+    def test_modified_nested_dict_serialized_as_modified(self):
+        """Mutated nested-dict values must serialize into the 'Modified' section
+        so they survive subsequent dump/load cycles."""
+        os.environ["FIGKEY"] = ""
+        defaults = {'db': {'host': 'localhost', 'user': ''}}
+        fig = figtion.Config(defaults=defaults, filepath=self.confpath)
+        fig['db']['user'] = 'postgres'
+        fig.dump()
+        with open(self.confpath) as f:
+            text = f.read()
+        mod_idx = text.find('Modified')
+        def_idx = text.find('Default')
+        user_idx = text.find("user: postgres")
+        assert mod_idx != -1 and user_idx != -1
+        assert mod_idx < user_idx < def_idx if def_idx != -1 else mod_idx < user_idx
 
     def test_recursive_strict_update_scalar_to_dict(self):
         """BUG: _recursive_strict_update crashes with AttributeError when a key holds

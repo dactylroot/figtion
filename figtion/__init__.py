@@ -1,4 +1,5 @@
 import os as _os
+import copy as _copy
 import yaml as _yaml
 from pathlib import Path as _Path
 import nacl.secret as _secret
@@ -17,7 +18,8 @@ class Config(dict):
             self._filepath = _os.path.abspath(_os.path.expanduser(filepath))
         else:
             self._filepath = None
-        self._defaults = defaults
+        ### Deep-copy so nested mutations don't alias self with self._defaults
+        self._defaults = _copy.deepcopy(defaults) if defaults else defaults
         self._interred = None
         self._masks = {}
         self._verbose=verbose
@@ -34,7 +36,7 @@ class Config(dict):
 
         ### Precedence of YAML over defaults
         if defaults:
-            self.update(defaults)
+            self.update(_copy.deepcopy(defaults))
         if self._filepath:
             self.load()
 
@@ -112,10 +114,10 @@ class Config(dict):
               * 'promiscuous=False': only items defined in 'a' are kept
               * 'promiscuous=True' : items defined in 'b' are also kept
         """
+        if not b:
+            return
         if not a:
             a.update(b)
-            return
-        if not b:
             return
 
         for key in b.keys():
@@ -165,7 +167,7 @@ class Config(dict):
                     print(f"Initialized config file '{self.filepath}'")
             elif type(e) is UnicodeDecodeError:
                 raise OSError(f"Missing the encryption key for file '{self.filepath}'")
-            elif isinstance(e, _nacl_exc.CryptoError):
+            elif isinstance(e, (_nacl_exc.CryptoError, _nacl_exc.ValueError)):
                 raise OSError(f"Decryption failed for '{self.filepath}': file may be plaintext but FIGKEY is set")
             else:
                 raise e
