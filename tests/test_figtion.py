@@ -2,6 +2,7 @@
 import os
 import sys
 import time
+import threading
 import pytest
 from pathlib import Path
 
@@ -139,13 +140,13 @@ class TestFigtion:
         assert( fig['password'] == self.defaults['password'] )
 
     def test_missing_encryption_key(self):
+        """Default (strict_secrets=True): a missing FIGKEY on an encrypted
+        secrets file is fatal with a clear message."""
         os.environ["FIGKEY"] = ""
 
-        try:
-            fig = figtion.Config(defaults=self.defaults,filepath=self.confpath,secretpath=self.secretpath)
-        except Exception as e:
-            assert( type(e) == OSError )
-            assert( str(e).startswith("Missing the encryption key for file"))
+        with pytest.raises(OSError, match="Missing the encryption key for file"):
+            figtion.Config(defaults=self.defaults, filepath=self.confpath,
+                           secretpath=self.secretpath)
 
     def test_mask_nested_key(self):
         try:
@@ -372,3 +373,95 @@ class TestFigtion:
         # if the error message happened to contain 'No such file'.
         assert not isinstance(e, FileNotFoundError)
         assert hasattr(e, 'strerror') and 'No such file' in e.strerror  # shows the risk
+
+    # --- cross-process file locking ---
+
+    def test_file_lock_reentrant_same_process(self, tmp_path):
+        """Nested _file_lock calls on the same path within one process must not
+        block each other (the mask()/dump()/_unmask() cycle nests load()/dump()
+        calls on the same file), and must fully release when the outermost
+        context exits."""
+        target = str(tmp_path / "reentrant.yml")
+        with figtion._file_lock(target):
+            assert figtion._lock_registry[target][1] == 1
+            with figtion._file_lock(target):
+                assert figtion._lock_registry[target][1] == 2
+            assert figtion._lock_registry[target][1] == 1
+        assert target not in figtion._lock_registry
+
+    def test_lock_registry_empty_after_normal_operations(self):
+        """dump()/mask() must not leak entries in the lock registry."""
+        fig = figtion.Config(defaults=self.defaults, filepath=self.confpath,
+                              secretpath=self.secretpath)
+        fig.mask('password')
+        fig.dump()
+        assert figtion._lock_registry == {}
+
+    def test_file_lock_serializes_across_processes(self, tmp_path):
+        """_file_lock must actually block a second, independent OS process —
+        not just guard against reentrancy within one process — since that is
+        the real gunicorn multi-worker race the lock exists to prevent."""
+        import subprocess
+
+        target = str(tmp_path / "shared.yml")
+        holder_script = (
+            "import sys; sys.path.insert(0, {figpath!r}); import figtion\n"
+            "with figtion._file_lock({target!r}):\n"
+            "    print('locked', flush=True)\n"
+            "    sys.stdin.readline()\n"
+        ).format(figpath=str(_mypath.parent), target=target)
+
+        proc = subprocess.Popen([sys.executable, '-c', holder_script],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            line = proc.stdout.readline()
+            assert line.strip() == 'locked'  # child now holds the lock
+
+            def _release_after_delay():
+                time.sleep(0.3)
+                proc.stdin.write('go\n')
+                proc.stdin.flush()
+
+            releaser = threading.Thread(target=_release_after_delay)
+            releaser.start()
+            try:
+                start = time.monotonic()
+                with figtion._file_lock(target):
+                    elapsed = time.monotonic() - start
+            finally:
+                releaser.join()
+        finally:
+            proc.wait(timeout=5)
+
+        assert elapsed >= 0.25, "parent acquired the lock before the child process released it"
+
+    # --- non-fatal secrets decryption failure (strict_secrets) ---
+
+    def test_strict_secrets_true_raises_on_bad_figkey(self):
+        """Default behavior (strict_secrets=True) is unchanged: a secrets file
+        that can't be decrypted under the current FIGKEY is fatal."""
+        os.environ["FIGKEY"] = "a-completely-different-key"
+        with pytest.raises(OSError, match="Decryption failed"):
+            figtion.Config(defaults=self.defaults, filepath=self.confpath,
+                           secretpath=self.secretpath)
+
+    def test_strict_secrets_false_degrades_on_bad_figkey(self):
+        """strict_secrets=False lets the outer Config construct even when the
+        secrets file can't be decrypted (e.g. FIGKEY rotated), instead of
+        crashing config initialization entirely. Masked fields simply keep
+        their mask placeholder until the correct key is restored."""
+        os.environ["FIGKEY"] = "a-completely-different-key"
+        fig = figtion.Config(defaults=self.defaults, filepath=self.confpath,
+                             secretpath=self.secretpath, strict_secrets=False)
+        assert fig._interred is None
+        assert fig['password'] == '*****'
+        with pytest.raises(Exception, match='Cannot mask without a secretpath'):
+            fig.mask('password')
+
+    def test_strict_secrets_false_degrades_on_missing_figkey(self):
+        """Same as above, for the 'FIGKEY unset entirely' case."""
+        os.environ["FIGKEY"] = ""
+        fig = figtion.Config(defaults=self.defaults, filepath=self.confpath,
+                             secretpath=self.secretpath, strict_secrets=False)
+        assert fig._interred is None
+        assert fig['password'] == '*****'

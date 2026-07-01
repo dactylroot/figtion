@@ -2,11 +2,61 @@ import os as _os
 import copy as _copy
 import time as _time
 import yaml as _yaml
+import contextlib as _contextlib
 from pathlib import Path as _Path
 import nacl.secret as _secret
 import nacl.exceptions as _nacl_exc
 
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - non-POSIX platform (e.g. Windows)
+    _fcntl = None
+
 _MASK_FLAG = "masked configs"
+
+### Process-wide advisory-lock registry, keyed by absolute file path.
+### Serializes load()/dump() across separate processes (e.g. gunicorn
+### workers) sharing the same file, while staying reentrant *within* a
+### single process so the mask()/dump()/_unmask() call chain — which can
+### nest load()/dump() calls against the same path — never self-deadlocks.
+_lock_registry = {}
+
+
+@_contextlib.contextmanager
+def _file_lock(path):
+    path = _os.path.abspath(path)
+    entry = _lock_registry.get(path)
+    if entry is not None:
+        entry[1] += 1
+        try:
+            yield
+        finally:
+            entry[1] -= 1
+        return
+
+    if _fcntl is None:
+        ### No advisory locking available on this platform; degrade to
+        ### unlocked access rather than blocking config reads/writes.
+        yield
+        return
+
+    lockpath = path + '.lock'
+    try:
+        _os.makedirs(_os.path.dirname(lockpath), exist_ok=True)
+        fd = _os.open(lockpath, _os.O_CREAT | _os.O_RDWR)
+        _fcntl.flock(fd, _fcntl.LOCK_EX)
+    except OSError:
+        yield
+        return
+
+    _lock_registry[path] = [fd, 1]
+    try:
+        yield
+    finally:
+        del _lock_registry[path]
+        _fcntl.flock(fd, _fcntl.LOCK_UN)
+        _os.close(fd)
+
 
 class Config(dict):
     ### Public flag: set to True when a dynamic reload pulled in new values.
@@ -17,7 +67,7 @@ class Config(dict):
     def filepath(self):
         return self._filepath
 
-    def __init__(self, filepath = None, defaults = None, secretpath = None, verbose=True, promiscuous=False, description = None, concise=False, reload_interval=5):
+    def __init__(self, filepath = None, defaults = None, secretpath = None, verbose=True, promiscuous=False, description = None, concise=False, reload_interval=5, strict_secrets=True):
         self.description = description if description else "configurations"
         if filepath:
             self._filepath = _os.path.abspath(_os.path.expanduser(filepath))
@@ -52,7 +102,22 @@ class Config(dict):
             else:
                 ### Inner secrets Config: disable its own reload checking;
                 ### the outer Config drives reloads for both files.
-                self._interred = Config(filepath=secretpath,description=_MASK_FLAG,promiscuous=True,reload_interval=None)
+                try:
+                    self._interred = Config(filepath=secretpath,description=_MASK_FLAG,promiscuous=True,reload_interval=None)
+                except OSError as e:
+                    ### A missing/mismatched FIGKEY (or corrupt secrets file) means
+                    ### secrets can't be decrypted right now. With strict_secrets=True
+                    ### (default) that's fatal, matching prior behavior. Otherwise,
+                    ### construct without decrypted secrets rather than failing the
+                    ### whole outer Config — mask()/_unmask() already treat a missing
+                    ### _interred as "nothing to resolve", so masked fields simply
+                    ### keep their mask placeholder until the key is restored.
+                    if strict_secrets:
+                        raise
+                    if verbose:
+                        print(f"Warning: could not load secrets file '{secretpath}' ({e}); "
+                              "continuing without decrypted secrets.")
+                    self._interred = None
 
         ### Precedence of YAML over defaults
         if defaults:
@@ -69,74 +134,78 @@ class Config(dict):
         if not self._filepath:
             raise ValueError("dump() requires a filepath")
 
-        ### Suppress _maybe_reload() for the mask + write phase so that dict
-        ### accesses inside _mask() and the list comprehensions below (self.keys(),
-        ### self[k]) do not trigger a file reload — which would recurse back into
-        ### _unmask() → dump() infinitely when reload_interval=0.
-        self._masking += 1
-        try:
-            self._mask()
+        ### Serialize the whole mask + write + unmask cycle against other
+        ### processes sharing this file. Reentrant, so the nested _unmask()
+        ### call below (which may itself call dump()) does not self-deadlock.
+        with _file_lock(self.filepath):
+            ### Suppress _maybe_reload() for the mask + write phase so that dict
+            ### accesses inside _mask() and the list comprehensions below (self.keys(),
+            ### self[k]) do not trigger a file reload — which would recurse back into
+            ### _unmask() → dump() infinitely when reload_interval=0.
+            self._masking += 1
+            try:
+                self._mask()
 
-            default_keys = set(self._defaults.keys()) if self._defaults else set()
-            used       = [k for k in self.keys() if k in default_keys]
-            modified   = {k:self[k] for k in used if self[k] != self._defaults[k]}
-            unmodified = {k:self[k] for k in used if self[k] == self._defaults[k]}
-            deprecated = {k:self[k] for k in self.keys() if k not in default_keys}
+                default_keys = set(self._defaults.keys()) if self._defaults else set()
+                used       = [k for k in self.keys() if k in default_keys]
+                modified   = {k:self[k] for k in used if self[k] != self._defaults[k]}
+                unmodified = {k:self[k] for k in used if self[k] == self._defaults[k]}
+                deprecated = {k:self[k] for k in self.keys() if k not in default_keys}
 
-            store = "%YAML 1.1\n---\n"
-            _yams = _yaml.dump(modified,default_flow_style=False,indent=4)
-            if self._concise:
-                store += _yams
-            else:
-                store += "# this file should be located at {}\n".format(self.filepath)
-                store += "\n\n"
-                store += "############################################################\n"
-                store += "#### {: ^50} ####\n".format(self.description)
-                store += "############################################################\n"
-                store += "\n\n"
-
-                store += "##############################\n"
-                store += "#### {: ^20} ####\n".format('Modified')
-                store += "##############################\n"
-                if modified:
+                store = "%YAML 1.1\n---\n"
+                _yams = _yaml.dump(modified,default_flow_style=False,indent=4)
+                if self._concise:
                     store += _yams
-                store += "\n\n"
-
-                if unmodified and not self._concise:
-                    store += "##############################\n"
-                    store += "#### {: ^20} ####\n".format('Default')
-                    store += "##############################\n"
-                    _yams = _yaml.dump(unmodified,default_flow_style=False,indent=4)
-                    store += _yams
+                else:
+                    store += "# this file should be located at {}\n".format(self.filepath)
+                    store += "\n\n"
+                    store += "############################################################\n"
+                    store += "#### {: ^50} ####\n".format(self.description)
+                    store += "############################################################\n"
                     store += "\n\n"
 
-                if deprecated and not self._concise:
                     store += "##############################\n"
-                    store += "#### {: ^20} ####\n".format('Deprecated')
+                    store += "#### {: ^20} ####\n".format('Modified')
                     store += "##############################\n"
-                    _yams = _yaml.dump(deprecated,default_flow_style=False,indent=4)
-                    store += _yams
+                    if modified:
+                        store += _yams
                     store += "\n\n"
 
-            # Store encrypted values
-            _os.makedirs(_Path(self.filepath).parent,exist_ok=True)
-            key = self._getcipherkey()
-            if key: # encrypt secrets before writing
-                box = _secret.SecretBox(key)
+                    if unmodified and not self._concise:
+                        store += "##############################\n"
+                        store += "#### {: ^20} ####\n".format('Default')
+                        store += "##############################\n"
+                        _yams = _yaml.dump(unmodified,default_flow_style=False,indent=4)
+                        store += _yams
+                        store += "\n\n"
 
-                store = box.encrypt(store.encode())
-                with open(self.filepath,'wb') as ymlfile:
-                    ymlfile.write(store.nonce + store.ciphertext)
-            else:
-                with open(self.filepath,'w') as ymlfile:
-                    ymlfile.write(store)
-        finally:
-            self._masking -= 1
-            ### Refresh mtimes so the _maybe_reload() check in _unmask() (and on
-            ### the next dict access) does not see a spurious change and re-trigger.
-            self._refresh_mtimes()
+                    if deprecated and not self._concise:
+                        store += "##############################\n"
+                        store += "#### {: ^20} ####\n".format('Deprecated')
+                        store += "##############################\n"
+                        _yams = _yaml.dump(deprecated,default_flow_style=False,indent=4)
+                        store += _yams
+                        store += "\n\n"
 
-        self._unmask()
+                # Store encrypted values
+                _os.makedirs(_Path(self.filepath).parent,exist_ok=True)
+                key = self._getcipherkey()
+                if key: # encrypt secrets before writing
+                    box = _secret.SecretBox(key)
+
+                    store = box.encrypt(store.encode())
+                    with open(self.filepath,'wb') as ymlfile:
+                        ymlfile.write(store.nonce + store.ciphertext)
+                else:
+                    with open(self.filepath,'w') as ymlfile:
+                        ymlfile.write(store)
+            finally:
+                self._masking -= 1
+                ### Refresh mtimes so the _maybe_reload() check in _unmask() (and on
+                ### the next dict access) does not see a spurious change and re-trigger.
+                self._refresh_mtimes()
+
+            self._unmask()
 
     def _recursive_strict_update(self,a,b):
         """ Update only items from 'b' which already have a key in 'a'.
@@ -174,36 +243,37 @@ class Config(dict):
 
     def load(self):
         """ Load from filepath and overwrite local items. """
-        try:
-            key = self._getcipherkey()
-            if key:
-                with open(self.filepath,'rb') as ymlfile:
-                    nc = ymlfile.read()
-                    nonce = nc[:_secret.SecretBox.NONCE_SIZE]
-                    ciphertext = nc[_secret.SecretBox.NONCE_SIZE:]
+        with _file_lock(self.filepath):
+            try:
+                key = self._getcipherkey()
+                if key:
+                    with open(self.filepath,'rb') as ymlfile:
+                        nc = ymlfile.read()
+                        nonce = nc[:_secret.SecretBox.NONCE_SIZE]
+                        ciphertext = nc[_secret.SecretBox.NONCE_SIZE:]
 
-                box = _secret.SecretBox(key)
-                newstuff = box.decrypt(ciphertext=ciphertext,nonce=nonce)
-                newstuff = newstuff.decode('utf-8')
+                    box = _secret.SecretBox(key)
+                    newstuff = box.decrypt(ciphertext=ciphertext,nonce=nonce)
+                    newstuff = newstuff.decode('utf-8')
 
-            else:
-                with open(self.filepath,'r') as ymlfile:
-                    newstuff = ymlfile.read()
+                else:
+                    with open(self.filepath,'r') as ymlfile:
+                        newstuff = ymlfile.read()
 
-            newstuff = _yaml.load(newstuff, Loader=_yaml.FullLoader)
-            self._recursive_strict_update(self,newstuff)
-            self._unmask()
-        except Exception as e:
-            if isinstance(e, FileNotFoundError):
-                self.dump()
-                if self._verbose:
-                    print(f"Initialized config file '{self.filepath}'")
-            elif type(e) is UnicodeDecodeError:
-                raise OSError(f"Missing the encryption key for file '{self.filepath}'")
-            elif isinstance(e, (_nacl_exc.CryptoError, _nacl_exc.ValueError)):
-                raise OSError(f"Decryption failed for '{self.filepath}': file may be plaintext but FIGKEY is set")
-            else:
-                raise e
+                newstuff = _yaml.load(newstuff, Loader=_yaml.FullLoader)
+                self._recursive_strict_update(self,newstuff)
+                self._unmask()
+            except Exception as e:
+                if isinstance(e, FileNotFoundError):
+                    self.dump()
+                    if self._verbose:
+                        print(f"Initialized config file '{self.filepath}'")
+                elif type(e) is UnicodeDecodeError:
+                    raise OSError(f"Missing the encryption key for file '{self.filepath}'")
+                elif isinstance(e, (_nacl_exc.CryptoError, _nacl_exc.ValueError)):
+                    raise OSError(f"Decryption failed for '{self.filepath}': file may be plaintext but FIGKEY is set")
+                else:
+                    raise e
 
     def _watched_files(self):
         files = []
