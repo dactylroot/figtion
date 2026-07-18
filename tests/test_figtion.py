@@ -377,17 +377,18 @@ class TestFigtion:
     # --- cross-process file locking ---
 
     def test_file_lock_reentrant_same_process(self, tmp_path):
-        """Nested _file_lock calls on the same path within one process must not
+        """Nested _file_lock calls on the same path within one thread must not
         block each other (the mask()/dump()/_unmask() cycle nests load()/dump()
         calls on the same file), and must fully release when the outermost
         context exits."""
         target = str(tmp_path / "reentrant.yml")
+        registry = figtion._thread_registry()
         with figtion._file_lock(target):
-            assert figtion._lock_registry[target][1] == 1
+            assert registry[target][1] == 1
             with figtion._file_lock(target):
-                assert figtion._lock_registry[target][1] == 2
-            assert figtion._lock_registry[target][1] == 1
-        assert target not in figtion._lock_registry
+                assert registry[target][1] == 2
+            assert registry[target][1] == 1
+        assert target not in registry
 
     def test_lock_registry_empty_after_normal_operations(self):
         """dump()/mask() must not leak entries in the lock registry."""
@@ -395,7 +396,145 @@ class TestFigtion:
                               secretpath=self.secretpath)
         fig.mask('password')
         fig.dump()
-        assert figtion._lock_registry == {}
+        assert figtion._thread_registry() == {}
+
+    def test_file_lock_serializes_across_threads(self, tmp_path):
+        """A second thread contending for the same path must actually block
+        until the first thread releases — not fall through unlocked because
+        the registry mistook it for a reentrant nested call. This is the
+        precise gunicorn-worker-threads race described in TODO: a
+        process-global registry keyed only by path can't distinguish 'I am
+        nested inside my own outer call' from 'another thread is mid-
+        operation here', so it must be scoped per-thread."""
+        target = str(tmp_path / "threaded.yml")
+        order = []
+        order_lock = threading.Lock()
+
+        def record(msg):
+            with order_lock:
+                order.append(msg)
+
+        def holder():
+            with figtion._file_lock(target):
+                record('A-enter')
+                time.sleep(0.3)
+                record('A-exit')
+
+        def contender():
+            time.sleep(0.1)
+            with figtion._file_lock(target):
+                record('B-enter')
+
+        t1 = threading.Thread(target=holder)
+        t2 = threading.Thread(target=contender)
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+
+        assert order == ['A-enter', 'A-exit', 'B-enter'], (
+            "thread B entered its critical section before thread A exited "
+            f"its own: {order}"
+        )
+
+    def test_concurrent_mask_calls_do_not_corrupt_secrets(self, tmp_path):
+        """Two threads racing mask() on the same Config for different keys
+        must not let one thread's stage-then-persist cycle interleave with
+        the other's and clobber the secrets file (the credential-corruption
+        symptom in TODO)."""
+        confpath = tmp_path / "conf.yml"
+        secretpath = tmp_path / "creds.yml"
+        fig = figtion.Config(defaults={'password': 'pw-value', 'token': 'tok-value'},
+                              filepath=confpath, secretpath=secretpath)
+
+        barrier = threading.Barrier(2)
+
+        def mask_field(key):
+            barrier.wait()
+            fig.mask(key)
+
+        t1 = threading.Thread(target=mask_field, args=('password',))
+        t2 = threading.Thread(target=mask_field, args=('token',))
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+
+        reloaded = figtion.Config(filepath=confpath, secretpath=secretpath, promiscuous=True)
+        assert reloaded['password'] == 'pw-value'
+        assert reloaded['token'] == 'tok-value'
+
+    def test_reader_never_sees_transient_mask_placeholder(self, tmp_path):
+        """A reader thread doing plain `cfg[key]` access must never observe
+        the literal mask placeholder ('*****') while another thread is
+        mid-mask()/dump() on the same Config instance. mask()'s stage-then-
+        persist cycle writes the placeholder into `self` before restoring
+        the real value; _file_lock alone doesn't protect readers, since
+        __getitem__/get/etc. never touch it — only self._state_lock does."""
+        confpath = tmp_path / "conf.yml"
+        secretpath = tmp_path / "creds.yml"
+        fig = figtion.Config(defaults={'password': 'real-secret-value'},
+                              filepath=confpath, secretpath=secretpath)
+        fig.mask('password')
+
+        saw_mask = threading.Event()
+        stop = threading.Event()
+
+        def writer():
+            for _ in range(50):
+                fig.dump()
+            stop.set()
+
+        def reader():
+            while not stop.is_set():
+                if fig['password'] == '*****':
+                    saw_mask.set()
+                    return
+
+        t_w = threading.Thread(target=writer)
+        t_r = threading.Thread(target=reader)
+        t_r.start(); t_w.start()
+        t_w.join()
+        t_r.join(timeout=2)
+
+        assert not saw_mask.is_set(), (
+            "reader observed the literal mask placeholder instead of the "
+            "real secret value while a concurrent dump() was in flight"
+        )
+
+    def test_swapped_config_roles_do_not_deadlock(self, tmp_path):
+        """Two Config graphs whose filepath/secretpath roles are swapped
+        relative to each other (A's main file is B's secrets file and vice
+        versa) must not deadlock when both mask() concurrently: mask()/dump()
+        must always acquire the two files' locks in the same fixed order,
+        never in the incidental order nested calls happen to reach them."""
+        ### Both files must stay plain YAML: setup_method sets FIGKEY, but A
+        ### treats y.yml as its (encrypted) secretpath while B treats the
+        ### same file as its (plain) filepath, and that role conflict — not
+        ### the deadlock this test targets — would break decryption if
+        ### encryption were active for either role.
+        os.environ.pop("FIGKEY", None)
+        x = tmp_path / "x.yml"
+        y = tmp_path / "y.yml"
+        a = figtion.Config(defaults={'k1': 'v1'}, filepath=x, secretpath=y)
+        b = figtion.Config(defaults={'k2': 'v2'}, filepath=y, secretpath=x)
+
+        barrier = threading.Barrier(2)
+
+        def mask_a():
+            barrier.wait()
+            a.mask('k1')
+
+        def mask_b():
+            barrier.wait()
+            b.mask('k2')
+
+        t1 = threading.Thread(target=mask_a)
+        t2 = threading.Thread(target=mask_b)
+        t1.start(); t2.start()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+        assert not t1.is_alive() and not t2.is_alive(), (
+            "mask() deadlocked across two Configs with swapped "
+            "filepath/secretpath roles"
+        )
 
     def test_file_lock_serializes_across_processes(self, tmp_path):
         """_file_lock must actually block a second, independent OS process —

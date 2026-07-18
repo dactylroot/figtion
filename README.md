@@ -114,16 +114,7 @@ If you want everything treated as secret, provide a `secretpath` and omit `filep
 
 In this case, no call to `mask` is needed and everything is encrypted at rest.
 
-#### Encryption Details
+## Encryption Details
 
 This uses the *pynacl* bindings to the *libsodium* library, which uses [the XSalsa20 algorithm](https://libsodium.gitbook.io/doc/advanced/stream_ciphers/xsalsa20) for encryption. The encryption key provided by the *FIGKEY* environment variable is truncated to a 32-byte string.
 
-## Roadmap
-  * support cascading configuration files
-
-## Changelog
-  * 1.3 - cross-process file locking for load/dump
-  * 1.2 - automatic+dynamic reloading of YAML files
-  * 1.1 - make default, modified, and unused properties explicit in plaintext
-  * 1.0 - secrets store in encrypted location
-  * 0.9 - secrets store in separate location

@@ -2,6 +2,7 @@ import os as _os
 import copy as _copy
 import time as _time
 import yaml as _yaml
+import threading as _threading
 import contextlib as _contextlib
 from pathlib import Path as _Path
 import nacl.secret as _secret
@@ -14,18 +15,34 @@ except ImportError:  # pragma: no cover - non-POSIX platform (e.g. Windows)
 
 _MASK_FLAG = "masked configs"
 
-### Process-wide advisory-lock registry, keyed by absolute file path.
-### Serializes load()/dump() across separate processes (e.g. gunicorn
-### workers) sharing the same file, while staying reentrant *within* a
-### single process so the mask()/dump()/_unmask() call chain — which can
-### nest load()/dump() calls against the same path — never self-deadlocks.
-_lock_registry = {}
+### Advisory-lock registry, keyed by absolute file path, tracking paths
+### *this thread* currently holds the OS-level lock for. Serializes
+### load()/dump() across separate processes (e.g. gunicorn workers) AND
+### separate threads within one process sharing the same file, while
+### staying reentrant *within a single thread* so the mask()/dump()/
+### _unmask() call chain — which can nest load()/dump() calls against the
+### same path — never self-deadlocks.
+###
+### This is thread-local by design: a bare dict keyed only by path cannot
+### tell "I am nested inside my own outer call" apart from "another thread
+### is mid-operation on this path" — the latter must still block on the
+### real flock(), not be waved through as if it were reentrant.
+_lock_registry = _threading.local()
+
+
+def _thread_registry():
+    try:
+        return _lock_registry.registry
+    except AttributeError:
+        _lock_registry.registry = {}
+        return _lock_registry.registry
 
 
 @_contextlib.contextmanager
 def _file_lock(path):
     path = _os.path.abspath(path)
-    entry = _lock_registry.get(path)
+    registry = _thread_registry()
+    entry = registry.get(path)
     if entry is not None:
         entry[1] += 1
         try:
@@ -49,11 +66,11 @@ def _file_lock(path):
         yield
         return
 
-    _lock_registry[path] = [fd, 1]
+    registry[path] = [fd, 1]
     try:
         yield
     finally:
-        del _lock_registry[path]
+        del registry[path]
         _fcntl.flock(fd, _fcntl.LOCK_UN)
         _os.close(fd)
 
@@ -95,6 +112,15 @@ class Config(dict):
         ### _maybe_reload() re-entry while mask/unmask operations are in flight.
         self._masking = 0
 
+        ### In-process guard, separate from _file_lock (which only serializes
+        ### the actual file I/O). load()/dump()/mask() hold this for their
+        ### *entire* body, including the window where a masked field is
+        ### transiently written into self as a placeholder before being
+        ### restored to its real value — so a concurrent reader on another
+        ### thread (__getitem__/get/etc., which never touch _file_lock) can't
+        ### observe that placeholder mid-cycle.
+        self._state_lock = _threading.RLock()
+
         if secretpath:
             if not filepath:
                 self._filepath = _os.path.abspath(_os.path.expanduser(secretpath))
@@ -127,6 +153,26 @@ class Config(dict):
         self._refresh_mtimes()
         self._reloading = False
 
+    @_contextlib.contextmanager
+    def _locked(self):
+        """ Acquire this Config's file lock(s) for the duration of load()/
+            dump()/mask(). When a secrets file is attached, both self.filepath
+            and self._interred.filepath are locked up front, in a fixed
+            (sorted) order — not the incidental order in which nested calls
+            happen to reach them — so that two Config graphs whose filepath/
+            secretpath roles are swapped relative to each other can never
+            acquire the two locks in opposite orders. Without this, one
+            Config's mask()/dump() taking filepath-then-secretpath can
+            deadlock against another Config taking secretpath-then-filepath
+            for the same two files. """
+        paths = {self.filepath}
+        if self._interred:
+            paths.add(self._interred.filepath)
+        with _contextlib.ExitStack() as stack:
+            for path in sorted(paths):
+                stack.enter_context(_file_lock(path))
+            yield
+
     def dump(self,filepath=None):
         """ Serialize to YAML """
         if filepath:
@@ -134,10 +180,12 @@ class Config(dict):
         if not self._filepath:
             raise ValueError("dump() requires a filepath")
 
-        ### Serialize the whole mask + write + unmask cycle against other
-        ### processes sharing this file. Reentrant, so the nested _unmask()
-        ### call below (which may itself call dump()) does not self-deadlock.
-        with _file_lock(self.filepath):
+        ### self._state_lock guards in-memory access (see its declaration);
+        ### _locked() serializes the actual file I/O against other processes/
+        ### threads sharing these files, in a deadlock-safe fixed order.
+        ### Reentrant, so the nested _unmask() call below (which may itself
+        ### call dump()) does not self-deadlock.
+        with self._state_lock, self._locked():
             ### Suppress _maybe_reload() for the mask + write phase so that dict
             ### accesses inside _mask() and the list comprehensions below (self.keys(),
             ### self[k]) do not trigger a file reload — which would recurse back into
@@ -243,7 +291,7 @@ class Config(dict):
 
     def load(self):
         """ Load from filepath and overwrite local items. """
-        with _file_lock(self.filepath):
+        with self._state_lock, self._locked():
             try:
                 key = self._getcipherkey()
                 if key:
@@ -327,36 +375,48 @@ class Config(dict):
             self.changed = True
 
     def __getitem__(self, key):
-        self._maybe_reload()
-        return super().__getitem__(key)
+        with self._state_lock:
+            self._maybe_reload()
+            return super().__getitem__(key)
 
     def __contains__(self, key):
-        self._maybe_reload()
-        return super().__contains__(key)
+        with self._state_lock:
+            self._maybe_reload()
+            return super().__contains__(key)
 
     def get(self, key, default=None):
-        self._maybe_reload()
-        return super().get(key, default)
+        with self._state_lock:
+            self._maybe_reload()
+            return super().get(key, default)
 
     def keys(self):
-        self._maybe_reload()
-        return super().keys()
+        ### Note: the returned view is still live against self after this
+        ### method returns and _state_lock is released, so iterating it
+        ### later is not itself protected against a concurrent mutation —
+        ### only the read at the moment of the call is guarded.
+        with self._state_lock:
+            self._maybe_reload()
+            return super().keys()
 
     def values(self):
-        self._maybe_reload()
-        return super().values()
+        with self._state_lock:
+            self._maybe_reload()
+            return super().values()
 
     def items(self):
-        self._maybe_reload()
-        return super().items()
+        with self._state_lock:
+            self._maybe_reload()
+            return super().items()
 
     def __iter__(self):
-        self._maybe_reload()
-        return super().__iter__()
+        with self._state_lock:
+            self._maybe_reload()
+            return super().__iter__()
 
     def __len__(self):
-        self._maybe_reload()
-        return super().__len__()
+        with self._state_lock:
+            self._maybe_reload()
+            return super().__len__()
 
     def _nestupdate(self,key,val):
         cfg = self
@@ -380,10 +440,16 @@ class Config(dict):
         if self._interred is None:
             raise Exception('Cannot mask without a secretpath serializing path.')
 
-        self._masks[cfg_key] = mask
-        if self._nestread(cfg_key) != mask:
-            self._interred[cfg_key] = self._nestread(cfg_key)
-        self._unmask()
+        ### Hold the same locks dump()/load() use for the whole stage+persist
+        ### cycle, not just the individual load()/dump() calls inside
+        ### _unmask() — otherwise another thread/process could interleave
+        ### between staging the secret here and _unmask() persisting it.
+        with self._state_lock, self._locked():
+            self._masks[cfg_key] = mask
+            current = self._nestread(cfg_key)
+            if current != mask:
+                self._interred[cfg_key] = current
+            self._unmask()
 
     def _mask(self):
         if self._masks:
