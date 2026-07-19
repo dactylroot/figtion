@@ -14,6 +14,7 @@ except ImportError:  # pragma: no cover - non-POSIX platform (e.g. Windows)
     _fcntl = None
 
 _MASK_FLAG = "masked configs"
+_DEFAULT_MASK = "*****"
 
 ### Advisory-lock registry, keyed by absolute file path, tracking paths
 ### *this thread* currently holds the OS-level lock for. Serializes
@@ -84,7 +85,7 @@ class Config(dict):
     def filepath(self):
         return self._filepath
 
-    def __init__(self, filepath = None, defaults = None, secretpath = None, verbose=True, promiscuous=False, description = None, concise=False, reload_interval=5, strict_secrets=True):
+    def __init__(self, filepath = None, defaults = None, secretpath = None, verbose=True, promiscuous=False, description = None, concise=False, reload_interval=5, strict_secrets=True, mask_fields=None):
         self.description = description if description else "configurations"
         if filepath:
             self._filepath = _os.path.abspath(_os.path.expanduser(filepath))
@@ -148,6 +149,29 @@ class Config(dict):
         ### Precedence of YAML over defaults
         if defaults:
             self.update(_copy.deepcopy(defaults))
+
+        ### Register masked fields *before* the load() below, not just via a
+        ### separate mask() call afterward. On a fresh install, filepath
+        ### doesn't exist yet, so load() (next) hits FileNotFoundError and
+        ### self-dumps a starter file — with self._masks still empty at that
+        ### point (the normal path: caller constructs, then calls mask()
+        ### afterward), that self-dump writes every field, including
+        ### soon-to-be-masked secrets, to filepath in plaintext, with
+        ### nothing yet staged in secretpath. Two processes/threads racing
+        ### to be the first-ever construction against that not-yet-existing
+        ### filepath can each hit this window. Pre-registering here means
+        ### the very first self-dump already masks these fields correctly -
+        ### see _mask(), invoked from within the load()-triggered dump()
+        ### below - equivalent to calling mask(key) for each field
+        ### immediately after construction, just early enough to cover that
+        ### first write too. Requires secretpath (mask() raises without one
+        ### anyway); each key must already exist in `defaults`.
+        if mask_fields:
+            if self._interred is None:
+                raise Exception('Cannot mask without a secretpath serializing path.')
+            for _key in mask_fields:
+                self._masks[_key] = _DEFAULT_MASK
+
         if self._filepath:
             self.load()
         self._refresh_mtimes()
@@ -166,7 +190,7 @@ class Config(dict):
             deadlock against another Config taking secretpath-then-filepath
             for the same two files. """
         paths = {self.filepath}
-        if self._interred:
+        if self._interred is not None:
             paths.add(self._interred.filepath)
         with _contextlib.ExitStack() as stack:
             for path in sorted(paths):
@@ -327,7 +351,7 @@ class Config(dict):
         files = []
         if self._filepath:
             files.append(self._filepath)
-        if self._interred and self._interred._filepath:
+        if self._interred is not None and self._interred._filepath:
             files.append(self._interred._filepath)
         return files
 
@@ -431,7 +455,7 @@ class Config(dict):
             cfg = dict.__getitem__(cfg, part)
         return cfg
 
-    def mask(self,cfg_key,mask='*****'):
+    def mask(self,cfg_key,mask=_DEFAULT_MASK):
         """ Separate flagged variables for storage.
             Replace flagged variables with mask value.
             Good for sensitive credentials.
@@ -463,7 +487,7 @@ class Config(dict):
 
     def _unmask(self):
         """ resolve hierarchy: {new_val > interred > mask} """
-        if not self._interred:
+        if self._interred is None:
             return
         self._interred.load()
 
@@ -487,7 +511,7 @@ class Config(dict):
 
     def __repr__(self):
         str = ('secret ' if self._allsecret else '') + f"config reading from {self._filepath}"
-        if self._interred:
+        if self._interred is not None:
             str+= f"\nsecrets stored in {self._interred._filepath}"
         if self._promiscuous:
             str+= "\npromiscuous mode"

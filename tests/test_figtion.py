@@ -604,3 +604,89 @@ class TestFigtion:
                              secretpath=self.secretpath, strict_secrets=False)
         assert fig._interred is None
         assert fig['password'] == '*****'
+
+    # --- mask_fields: pre-registering masked keys before the first load() ---
+
+    def test_mask_fields_masks_the_very_first_self_dump(self, tmp_path):
+        """Without mask_fields, constructing against a not-yet-existing
+        filepath self-dumps every default field in plaintext (mask() isn't
+        called until after __init__ returns, so self._masks is still empty
+        during that first, load()-triggered dump()). mask_fields registers
+        the field before that first dump(), so even the file this
+        construction call itself creates is properly masked.
+
+        FIGKEY is cleared here (setup_method sets it class-wide) so
+        secretpath stays plain YAML - this test is isolating the masking
+        behavior itself, not encryption, which has its own dedicated tests
+        below."""
+        os.environ["FIGKEY"] = ""
+        confpath = tmp_path / "conf.yml"
+        secretpath = tmp_path / "creds.yml"
+        assert not confpath.exists()
+
+        fig = figtion.Config(defaults={'password': 'real-secret-value', 'host': 'example.com'},
+                              filepath=confpath, secretpath=secretpath,
+                              mask_fields=['password'])
+
+        assert confpath.exists()
+        raw = confpath.read_text()
+        assert 'real-secret-value' not in raw, "plaintext secret leaked into filepath on first construction"
+        assert '*****' in raw
+        assert 'real-secret-value' in secretpath.read_text()
+        # In-memory value still resolves normally for the constructing process.
+        assert fig['password'] == 'real-secret-value'
+        assert fig['host'] == 'example.com'
+
+    def test_mask_fields_requires_secretpath(self, tmp_path):
+        with pytest.raises(Exception, match='Cannot mask without a secretpath'):
+            figtion.Config(defaults={'password': 'x'}, filepath=tmp_path / "conf.yml",
+                           mask_fields=['password'])
+
+    def test_concurrent_first_construction_with_mask_fields_never_leaks_plaintext(self, tmp_path):
+        """The actual race mask_fields exists to close: several
+        processes/threads (here, threads - the underlying risk is the same
+        Config.__init__ code path either way) racing to be the first-ever
+        construction against a not-yet-existing filepath, each with
+        mask_fields set. Without pre-registration, each independently-
+        constructed Config could self-dump its own in-memory defaults
+        unmasked before any of them gets a chance to call mask() the normal,
+        post-construction way - this reproduces exactly that window.
+
+        FIGKEY is cleared (see test_mask_fields_masks_the_very_first_self_dump
+        for why) so secretpath's content can be asserted on directly."""
+        os.environ["FIGKEY"] = ""
+        confpath = tmp_path / "conf.yml"
+        secretpath = tmp_path / "creds.yml"
+        n_workers = 12
+        barrier = threading.Barrier(n_workers)
+        errors = []
+
+        def build(idx):
+            try:
+                barrier.wait()
+                fig = figtion.Config(
+                    defaults={'password': 'real-secret-value', 'host': 'example.com'},
+                    filepath=confpath, secretpath=secretpath,
+                    mask_fields=['password'],
+                )
+                assert fig['password'] == 'real-secret-value'
+            except Exception as e:
+                errors.append((idx, repr(e)))
+
+        threads = [threading.Thread(target=build, args=(i,)) for i in range(n_workers)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        assert not errors, errors
+        raw = confpath.read_text()
+        assert 'real-secret-value' not in raw, (
+            "plaintext secret leaked into filepath during concurrent first construction"
+        )
+        assert 'real-secret-value' in secretpath.read_text()
+
+        reloaded = figtion.Config(filepath=confpath, secretpath=secretpath,
+                                  defaults={'password': '', 'host': ''}, mask_fields=['password'])
+        assert reloaded['password'] == 'real-secret-value'
+        assert reloaded['host'] == 'example.com'
